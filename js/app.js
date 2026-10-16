@@ -1,7 +1,7 @@
 'use strict';
 /* アプリ本体: 画面の切り替え・コマンド・メニュー・キーボード・自動保存 */
 
-const APP_VERSION = '0.3.0';
+const APP_VERSION = '0.4.0';
 
 class App {
   constructor() {
@@ -331,6 +331,7 @@ class App {
       { label: '開く', action: () => this.openWork(w.id) },
       { label: '名前を変更', action: async () => { const n = await promptDialog('作品名', w.name); if (n) { await Store.rename(w.id, n.trim() || w.name); this.renderGallery(); } } },
       { label: '複製', action: async () => { await Store.duplicate(w.id); this.renderGallery(); } },
+      { label: '.sko で書き出す（exe 版で開ける）', action: async () => { const { doc } = await Store.loadDoc(w.id); doc.name = w.name; await this.exportSko(doc); } },
       { label: 'PNG で書き出す', action: async () => {
         const { doc } = await Store.loadDoc(w.id);
         const blob = await canvasToBlob(doc.flattened());
@@ -383,6 +384,40 @@ class App {
       input.value = '';
       const done = () => { input.removeEventListener('change', on); resolve(input.files && input.files[0] ? input.files[0] : null); };
       const on = () => done();
+      input.addEventListener('change', on);
+      input.click();
+    });
+  }
+  /** .sko か画像を開いて新しい作品にする */
+  async openFile(file) {
+    if (!file) return;
+    try {
+      let doc, notes = [];
+      if (/\.sko$/i.test(file.name || '') || await isZip(file)) ({ doc, notes } = await docFromSko(file, skoName(file.name)));
+      else { const r = await docFromImageFile(file); doc = r.doc; if (r.note) notes = [r.note]; }
+      if (this.doc) await this.closeDoc();
+      this.openDoc(doc);
+      if (notes.length) openDialog({ title: '開きました（お知らせ）', message: notes.join('\n'), buttons: [{ label: 'OK', value: 'ok', primary: true }] });
+    } catch (e) {
+      console.error(e);
+      toast('開けませんでした: ' + e.message, { error: true });
+    }
+  }
+  async exportSko(doc = this.doc) {
+    try {
+      const blob = await docToSko(doc);
+      const res = await saveBlob(new Blob([blob], { type: 'application/octet-stream' }), safeName(doc.name) + '.sko');
+      if (res === 'downloaded') toast('.sko を書き出しました（exe 版の彩工房で開けます）');
+    } catch (e) {
+      console.error(e);
+      toast('書き出せませんでした: ' + e.message, { error: true });
+    }
+  }
+  pickAnyFile() {
+    return new Promise((resolve) => {
+      const input = $('#fileInputAny');
+      input.value = '';
+      const on = () => { input.removeEventListener('change', on); resolve(input.files && input.files[0] ? input.files[0] : null); };
       input.addEventListener('change', on);
       input.click();
     });
@@ -612,6 +647,8 @@ class App {
       'file.photo': () => this.newFromPhoto(),
       'file.place': async () => { const f = await this.pickFile(); if (f) this.placeImage(f, (f.name || '画像').replace(/\.[^.]+$/, '')); },
       'file.png': () => this.exportDialog('png'),
+      'file.sko': () => this.exportSko(),
+      'file.open': async () => this.openFile(await this.pickAnyFile()),
       'file.jpeg': () => this.exportDialog('jpeg'),
       'file.rename': async () => { const n = await promptDialog('作品名', d.name); if (n && n.trim()) { d.name = n.trim(); $('#docTitle').textContent = d.name; d.emit('meta'); this.saveNow(); } },
       'file.duplicate': async () => { await this.saveNow(); const id = await Store.duplicate(d.workId); if (id) { await this.closeDoc(); this.openWork(id); toast('複製を開きました'); } },
@@ -719,7 +756,7 @@ class App {
     let fn = C[name];
     if (!fn && name.startsWith('adj.')) fn = () => this.adjust.start(name.slice(4));
     if (!fn) { console.warn('unknown command', name); return; }
-    if (!d && !name.startsWith('file.new') && name !== 'file.photo') return;
+    if (!d && !['file.new', 'file.photo', 'file.open'].includes(name)) return;
     if (!name.startsWith('view.') && name !== 'edit.undo' && name !== 'edit.redo') this.settle();
     try {
       const r = fn();
@@ -736,9 +773,9 @@ class App {
     const it = (label, cmd, key, extra = {}) => ({ label, key, action: () => this.cmd(cmd), ...extra });
     switch (name) {
       case 'file': return [
-        it('新規…', 'file.new'), it('写真から新しい作品…', 'file.photo'), '-',
+        it('新規…', 'file.new'), it('写真から新しい作品…', 'file.photo'), it('ファイルを開く（.sko・画像）…', 'file.open', M + 'O'), '-',
         it('画像をレイヤーとして配置…', 'file.place'), '-',
-        it('PNG で書き出し…', 'file.png'), it('JPEG で書き出し…', 'file.jpeg'), '-',
+        it('彩工房ファイル（.sko）で書き出し', 'file.sko'), it('PNG で書き出し…', 'file.png'), it('JPEG で書き出し…', 'file.jpeg'), '-',
         it('作品名を変更…', 'file.rename'), it('作品を複製', 'file.duplicate'), it('今すぐ保存', 'file.save', M + 'S'), '-',
         it('作品一覧へ', 'file.gallery'),
       ];
@@ -837,6 +874,10 @@ class App {
   bindUI() {
     $('#galNew').addEventListener('click', () => this.cmd('file.new'));
     $('#galPhoto').addEventListener('click', () => this.cmd('file.photo'));
+    $('#galOpen').addEventListener('click', async () => this.openFile(await this.pickAnyFile()));
+    // ファイルを落としたら開く（PC 用。作品一覧では新しい作品、編集中の画像はレイヤーとして配置）
+    $('#gallery').addEventListener('dragover', (e) => e.preventDefault());
+    $('#gallery').addEventListener('drop', (e) => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) this.openFile(f); });
     $('#galMenu').addEventListener('click', (e) => openMenu(e.currentTarget, [
       { label: '保存領域を確保する（消されにくくする）', action: async () => {
         const ok = navigator.storage && navigator.storage.persist ? await navigator.storage.persist() : false;
@@ -870,6 +911,8 @@ class App {
     $('#viewport').addEventListener('dragover', (e) => e.preventDefault());
     $('#viewport').addEventListener('drop', (e) => {
       e.preventDefault();
+      const sko = [...e.dataTransfer.files].find((x) => /\.sko$/i.test(x.name));
+      if (sko) { this.openFile(sko); return; }
       const f = [...e.dataTransfer.files].find((x) => x.type.startsWith('image/'));
       if (f && this.doc) this.placeImage(f, f.name.replace(/\.[^.]+$/, ''));
     });
@@ -907,6 +950,7 @@ class App {
         if (k === 'e') return run(e.shiftKey ? 'layer.mergeVisible' : 'layer.mergeDown');
         if (k === 'n' && e.shiftKey) return run('layer.new');
         if (k === 's') return run('file.save');
+        if (k === 'o') return run('file.open');
         if (k === '0') return run('view.fit');
         if (k === '1') return run('view.actual');
         if (k === '=' || k === '+' || k === ';') return run('view.zoomIn');
@@ -958,6 +1002,10 @@ class App {
   }
 }
 
+/** ZIP（.sko）かどうかを先頭の4バイトで見る（名前に拡張子が無い時のため） */
+async function isZip(file) {
+  try { const b = new Uint8Array(await file.slice(0, 4).arrayBuffer()); return b[0] === 0x50 && b[1] === 0x4b && b[2] === 3 && b[3] === 4; } catch { return false; }
+}
 function safeName(s) { return String(s || '作品').replace(/[\\/:*?"<>|]/g, '_').slice(0, 80); }
 
 // ---- 起動 ------------------------------------------------------------------------

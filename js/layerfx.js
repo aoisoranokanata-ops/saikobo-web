@@ -237,7 +237,6 @@ function styleMargin(styles) {
   if ((s = styleOn(styles, 'stroke'))) m = Math.max(m, s.size + 2);
   return Math.ceil(m);
 }
-function rgbaStr(hex, a) { const [r, g, b] = Color.hexToRgb(hex) || [0, 0, 0]; return `rgba(${r},${g},${b},${clamp(a, 0, 1)})`; }
 
 function styledSource(ctx, layer, pix, mask, depth) {
   const { doc, r } = ctx;
@@ -250,34 +249,67 @@ function styledSource(ctx, layer, pix, mask, depth) {
   return { canvas: out, ox: r.x - E.x, oy: r.y - E.y };
 }
 
-/** 影の描き方: 画像本体は画面の外に描いて、影だけを (dx, dy) の位置に落とす */
-function drawShadowOnly(g, src, w, h, color, blur, dx, dy) {
-  const OFF = w + 64 + Math.ceil(blur * 3);
-  g.save();
-  g.shadowColor = color;
-  g.shadowBlur = Math.max(0, blur);
-  g.shadowOffsetX = dx + OFF;
-  g.shadowOffsetY = dy;
-  g.drawImage(src, 0, 0, w, h, -OFF, 0, w, h);
-  g.restore();
-}
-/** アルファ（0..1）を canvas に（色は黒） */
-function alphaCanvas(key, A, w, h) {
-  const c = poolCanvas(key, w, h), g = ctx2d(c);
-  const img = g.createImageData(w, h);
-  for (let i = 0; i < A.length; i++) img.data[i * 4 + 3] = A[i] * 255;
-  g.putImageData(img, 0, 0);
-  return c;
-}
 function readAlpha(c, w, h) {
   const d = ctx2d(c).getImageData(0, 0, w, h).data;
   const A = new Float32Array(w * h);
   for (let i = 0; i < A.length; i++) A[i] = d[i * 4 + 3] / 255;
   return A;
 }
-/** 太らせる・細らせる（距離変換。輪郭は 1px でなめらかに） */
+/** OpenCV の MORPH_ELLIPSE（2k+1 角）と同じ形の窓で、明るさの最大（太らせる）・最小（細らせる）。
+   exe の styles._dilate / _erode と同じ結果になる（半透明の輪郭もそのまま広がる）。外側は 0 とみなす */
+function ellipseMorph(A, w, h, r, isMax) {
+  const k = Math.ceil(r);
+  const halfw = [];                               // 行のずれ dy ごとの横の半幅（OpenCV と同じ丸め）
+  for (let dy = -k; dy <= k; dy++) halfw.push(Math.round(Math.sqrt(Math.max(0, k * k - dy * dy))));
+  const widths = [...new Set(halfw)];
+  const rows = new Map();                         // 半幅 → 横方向に最大・最小をとった画像
+  const op = isMax ? Math.max : Math.min;
+  for (const hw of widths) {
+    const out = new Float32Array(w * h);
+    for (let y = 0; y < h; y++) {
+      const o = y * w;
+      for (let x = 0; x < w; x++) {
+        let v = isMax ? 0 : 1;
+        const x0 = x - hw, x1 = x + hw;
+        if (!isMax && (x0 < 0 || x1 >= w)) v = 0;              // 外側は 0（細らせると端から削れる）
+        for (let xx = Math.max(0, x0); xx <= Math.min(w - 1, x1); xx++) v = op(v, A[o + xx]);
+        out[o + x] = v;
+      }
+    }
+    rows.set(hw, out);
+  }
+  const res = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let v = isMax ? 0 : 1;
+      for (let j = 0; j < halfw.length; j++) {
+        const yy = y + j - k;
+        if (yy < 0 || yy >= h) { if (!isMax) v = 0; continue; }
+        v = op(v, rows.get(halfw[j])[yy * w + x]);
+      }
+      res[y * w + x] = v;
+    }
+  }
+  return res;
+}
+/** σ = 0.5 のガウスぼかし（exe の境界線の _blur(…, 1.0)） */
+function blurHalf(A, w, h) {
+  const k = [0.1065, 0.787, 0.1065];
+  const t = new Float32Array(A.length), o = new Float32Array(A.length);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const i = y * w + x;
+    t[i] = A[i] * k[1] + (x > 0 ? A[i - 1] : 0) * k[0] + (x < w - 1 ? A[i + 1] : 0) * k[2];
+  }
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const i = y * w + x;
+    o[i] = t[i] * k[1] + (y > 0 ? t[i - w] : 0) * k[0] + (y < h - 1 ? t[i + w] : 0) * k[2];
+  }
+  return o;
+}
+/** 太らせる・細らせる。ふつうの大きさは exe と同じ窓、大きいときは距離変換で（速さのため。輪郭は 1px でなめらかに） */
 function dilateA(A, w, h, r) {
   if (r < 0.5) return A;
+  if (r <= 24) return ellipseMorph(A, w, h, r, true);
   const bin = new Uint8Array(A.length);
   for (let i = 0; i < A.length; i++) bin[i] = A[i] >= 0.5 ? 1 : 0;
   const d = distanceTransform(bin, w, h, 1);
@@ -287,11 +319,37 @@ function dilateA(A, w, h, r) {
 }
 function erodeA(A, w, h, r) {
   if (r < 0.5) return A;
+  if (r <= 24) return ellipseMorph(A, w, h, r, false);
   const bin = new Uint8Array(A.length);
   for (let i = 0; i < A.length; i++) bin[i] = A[i] >= 0.5 ? 1 : 0;
   const d = distanceTransform(bin, w, h, 0);
   const o = new Float32Array(A.length);
   for (let i = 0; i < A.length; i++) o[i] = Math.min(A[i], clamp(Math.sqrt(d[i]) - r, 0, 1));
+  return o;
+}
+/** (dx, dy) ずらす（小数は双線形。はみ出た所は fill）= exe の _shift（cv2.warpAffine） */
+function shiftA(A, w, h, dx, dy, fill = 0) {
+  const o = new Float32Array(A.length);
+  const at = (x, y) => (x < 0 || y < 0 || x >= w || y >= h ? fill : A[y * w + x]);
+  for (let y = 0; y < h; y++) {
+    const sy = y - dy, y0 = Math.floor(sy), fy = sy - y0;
+    for (let x = 0; x < w; x++) {
+      const sx = x - dx, x0 = Math.floor(sx), fx = sx - x0;
+      o[y * w + x] = (at(x0, y0) * (1 - fx) + at(x0 + 1, y0) * fx) * (1 - fy) + (at(x0, y0 + 1) * (1 - fx) + at(x0 + 1, y0 + 1) * fx) * fy;
+    }
+  }
+  return o;
+}
+/** ガウスぼかし（σ）。exe の _blur(a, size) は σ = size/2 */
+function blurA(A, w, h, sigma) {
+  if (sigma <= 0) return A;
+  // 外側は 0（exe の BORDER_CONSTANT）。余白を付けてからぼかして切り出す
+  const p = Math.ceil(sigma * 3) + 2, pw = w + p * 2, ph = h + p * 2;
+  const big = new Float32Array(pw * ph);
+  for (let y = 0; y < h; y++) big.set(A.subarray(y * w, y * w + w), (y + p) * pw + p);
+  gaussBlurF(big, pw, ph, 1, sigma);
+  const o = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) o.set(big.subarray((y + p) * pw + p, (y + p) * pw + p + w), y * w);
   return o;
 }
 function ringCanvas(key, ring, w, h, color, opacity) {
@@ -314,22 +372,22 @@ function drawStyles(out, cont, w, h, styles, depth) {
   const alpha = () => (A ||= readAlpha(cont, w, h));
   const offset = (s) => { const a = (s.angle * Math.PI) / 180; return [-Math.cos(a) * s.distance, Math.sin(a) * s.distance]; };
   let s;
+  // 影・光彩は exe の core/styles.py と同じ式で計算する（ずらす → 太らせる → ガウスぼかし）
   if ((s = styleOn(styles, 'drop_shadow'))) {
     const [dx, dy] = offset(s);
     const spread = s.size * s.spread / 100;
-    const src = spread >= 0.5 ? alphaCanvas('st_sp' + depth, dilateA(alpha(), w, h, spread), w, h) : cont;
-    drawShadowOnly(g, src, w, h, rgbaStr(s.color, s.opacity / 100), s.size * (1 - s.spread / 100), dx, dy);
+    const sh = blurA(dilateA(shiftA(alpha(), w, h, dx, dy), w, h, spread), w, h, s.size * (1 - s.spread / 100) / 2);
+    g.drawImage(ringCanvas('st_ds' + depth, sh, w, h, s.color, s.opacity / 100), 0, 0, w, h, 0, 0, w, h);
   }
   if ((s = styleOn(styles, 'outer_glow'))) {
     const spread = s.size * s.spread / 100;
-    const src = spread >= 0.5 ? alphaCanvas('st_sp' + depth, dilateA(alpha(), w, h, spread), w, h) : cont;
-    const blur = s.size * (1 - s.spread / 100) * 1.5;
-    drawShadowOnly(g, src, w, h, rgbaStr(s.color, s.opacity / 100), blur, 0, 0);
-    drawShadowOnly(g, src, w, h, rgbaStr(s.color, s.opacity / 200), blur, 0, 0);       // exe の 1.5 倍の強さに近づける
+    const gl = blurA(dilateA(alpha(), w, h, spread), w, h, s.size * (1 - s.spread / 100) * 1.5 / 2);
+    for (let i = 0; i < gl.length; i++) gl[i] = Math.min(1, gl[i] * 1.5);
+    g.drawImage(ringCanvas('st_gl' + depth, gl, w, h, s.color, s.opacity / 100), 0, 0, w, h, 0, 0, w, h);
   }
   const stroke = styleOn(styles, 'stroke');
   if (stroke && stroke.position === 'outside') {
-    const a = alpha(), dil = dilateA(a, w, h, stroke.size);
+    const a = alpha(), dil = blurHalf(dilateA(a, w, h, stroke.size), w, h);
     const ring = new Float32Array(a.length);
     for (let i = 0; i < a.length; i++) ring[i] = Math.max(0, dil[i] - a[i]);
     g.drawImage(ringCanvas('st_ring' + depth, ring, w, h, stroke.color, stroke.opacity / 100), 0, 0, w, h, 0, 0, w, h);
@@ -345,15 +403,11 @@ function drawStyles(out, cont, w, h, styles, depth) {
   } else g.drawImage(cont, 0, 0, w, h, 0, 0, w, h);
   if ((s = styleOn(styles, 'inner_shadow'))) {
     const [dx, dy] = offset(s);
-    const inv = poolCanvas('st_inv' + depth, w, h), ig = ctx2d(inv);
-    ig.fillStyle = s.color; ig.fillRect(0, 0, w, h);
-    ig.globalCompositeOperation = 'destination-out';
-    ig.drawImage(cont, 0, 0, w, h, dx, dy, w, h);
-    const bl = poolCanvas('st_bl' + depth, w, h), bg = ctx2d(bl);
-    if (s.size > 0) drawShadowOnly(bg, inv, w, h, s.color, s.size, 0, 0); else bg.drawImage(inv, 0, 0, w, h, 0, 0, w, h);
-    bg.globalCompositeOperation = 'destination-in';
-    bg.drawImage(cont, 0, 0, w, h, 0, 0, w, h);
-    g.save(); g.globalAlpha = s.opacity / 100; g.drawImage(bl, 0, 0, w, h, 0, 0, w, h); g.restore();
+    const a = alpha();
+    const inv = a.map((v) => 1 - v);
+    const bl = blurA(shiftA(inv, w, h, dx, dy, 1), w, h, s.size / 2);
+    for (let i = 0; i < bl.length; i++) bl[i] *= a[i];
+    g.drawImage(ringCanvas('st_is' + depth, bl, w, h, s.color, s.opacity / 100), 0, 0, w, h, 0, 0, w, h);
   }
   if (stroke && stroke.position !== 'outside') {
     const a = alpha();

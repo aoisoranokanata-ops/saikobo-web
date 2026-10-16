@@ -525,3 +525,119 @@ async function saikoboSelfTest3() {
   return out.join('\n') + `\n---- ${out.length - fails} OK / ${fails} FAIL`;
 }
 function px0(c, x, y) { return Array.from(ctx2d(c).getImageData(x, y, 1, 1).data); }
+
+
+/* フェーズ4: .sko（exe 版との往復）
+   exe との比べ方: python tools/make_sko_fixture.py で exe_sample.sko / .png を作っておく（無ければその項目は飛ばす）。
+   Web → exe は、このテストが web_sample.sko / .png を tools/fixtures に PUT する（tools/devserver.py が受け取る）ので、
+   続けて python tools/make_sko_fixture.py --check tools/fixtures/web_sample.sko tools/fixtures/web_sample.png */
+function buildWebSample() {
+  const W = 240, H = 180;
+  const doc = new Doc(W, H, { name: 'web_sample' });
+  doc.history.clear('新規');
+  const g0 = doc.layers[0].ctx, gr = g0.createLinearGradient(0, 0, W, H);
+  gr.addColorStop(0, '#203a43'); gr.addColorStop(1, '#2c5364'); g0.fillStyle = gr; g0.fillRect(0, 0, W, H);
+  const mk = (name, draw, setup) => { const l = new Layer(W, H, name); if (draw) draw(l.ctx); if (setup) setup(l); doc.insertAbove(l, doc.active); doc.activeId = l.id; return l; };
+  const C = mk('円', (g) => { g.fillStyle = '#f7b733'; g.beginPath(); g.arc(80, 90, 45, 0, Math.PI * 2); g.fill(); }, (l) => {
+    l.styles = { stroke: { ...styleDefaults('stroke'), size: 5, color: '#ffffff' }, drop_shadow: { ...styleDefaults('drop_shadow'), distance: 8, size: 6 },
+      inner_shadow: { ...styleDefaults('inner_shadow'), distance: 4, size: 4 } };
+  });
+  mk('しま', (g) => { g.fillStyle = 'rgba(200,30,30,.5)'; for (let x = 0; x < W; x += 14) g.fillRect(x, 0, 5, H); }, (l) => { l.clip = true; });
+  doc.setActive(C); doc.groupLayer(C);
+  const G = doc.active; G.blend = 'normal'; G.opacity = 0.9;
+  const T = new Layer(W, H, '文字');
+  T.text = makeTextSpec('彩工房', 120, 110, { size: 40, color: '#ffffff', bold: true });
+  T.canvas = renderTextSpec(T.text, W, H);
+  T.styles = { outer_glow: { ...styleDefaults('outer_glow'), size: 6 }, color_overlay: { ...styleDefaults('color_overlay'), color: '#ffe680', opacity: 50 } };
+  doc.insertAbove(T, G); doc.activeId = T.id;          // 開いたグループの「上」= グループの中の一番上
+  const M = mk('スクリーン', (g) => { g.fillStyle = '#3070ff'; g.beginPath(); g.arc(180, 60, 40, 0, Math.PI * 2); g.fill(); }, (l) => { l.blend = 'screen'; l.opacity = 0.8; });
+  M.mask = newCanvas(W, H);
+  { const mg = M.mask.getContext('2d'), m2 = mg.createLinearGradient(140, 0, 220, 0); m2.addColorStop(0, 'rgba(255,255,255,0)'); m2.addColorStop(1, '#fff'); mg.fillStyle = m2; mg.fillRect(0, 0, W, H); }
+  const A = new Layer(W, H, 'レベル', null, { kind: 'adjustment' });
+  A.adjustment = { key: 'levels', params: { ...defaultParams(ADJUSTMENTS.levels), in_black: 15, gamma: 1.2 } };
+  doc.insertAbove(A, M);
+  const B = new Layer(W, H, '白黒', null, { kind: 'adjustment' });
+  B.adjustment = { key: 'black_white', params: defaultParams(ADJUSTMENTS.black_white) };
+  B.opacity = 0.35;
+  doc.insertAbove(B, A);
+  doc.compDirty = doc.fullRect;
+  return doc;
+}
+function imageDiff(a, b) {
+  let sum = 0, mx = 0, over = 0;
+  for (let i = 0; i < a.length; i += 4) {
+    let m = 0;
+    for (let k = 0; k < 4; k++) { const d = Math.abs(a[i + k] - b[i + k]); sum += d; m = Math.max(m, d); }
+    mx = Math.max(mx, m); if (m > 8) over++;
+  }
+  return { mean: sum / a.length, max: mx, overPct: over / (a.length / 4) * 100 };
+}
+async function saikoboSelfTest4() {
+  const out = [];
+  const ok = (cond, msg) => { out.push((cond ? 'OK   ' : 'FAIL ') + msg); };
+  const pixels = (c) => ctx2d(c).getImageData(0, 0, c.width, c.height).data;
+
+  // 1) ZIP の読み書き
+  const enc = new TextEncoder();
+  const z = zipStore([{ name: 'a.txt', data: enc.encode('こんにちは') }, { name: 'dir/b.bin', data: new Uint8Array([0, 1, 2, 255]) }]);
+  const back = await unzip(z);
+  ok(await back['a.txt'].text() === 'こんにちは' && new Uint8Array(await back['dir/b.bin'].arrayBuffer())[3] === 255, 'ZIP（無圧縮）を書いて読める・日本語の名前');
+  ok(crc32(enc.encode('123456789')) === 0xCBF43926, 'CRC32（標準の検査値）');
+  if (window.CompressionStream) {
+    // deflate の ZIP も読めるか（中身を CompressionStream で作る）
+    const raw = enc.encode('圧縮のテスト'.repeat(50));
+    const comp = new Uint8Array(await new Response(new Blob([raw]).stream().pipeThrough(new CompressionStream('deflate-raw'))).arrayBuffer());
+    const zb = new Uint8Array(await zipStore([{ name: 'c.txt', data: comp }]).arrayBuffer());
+    const dv = new DataView(zb.buffer);
+    dv.setUint16(8, 8, true); dv.setUint32(22, raw.length, true);                   // 局所ヘッダ: 方式 = deflate
+    const cd = zb.length - 22 - 46 - 5;
+    dv.setUint16(cd + 10, 8, true); dv.setUint32(cd + 24, raw.length, true);       // 目次: 方式 = deflate
+    const r = await unzip(new Blob([zb]));
+    ok(await r['c.txt'].text() === '圧縮のテスト'.repeat(50), 'deflate で圧縮された ZIP も読める');
+  }
+
+  // 2) .sko を書いて読む（Web の中で往復）
+  const doc = buildWebSample();
+  const sko = await docToSko(doc);
+  const files = await unzip(sko);
+  const meta = JSON.parse(await files['document.json'].text());
+  ok(meta.format === 'saikobo' && meta.version === 4 && meta.layers.length === doc.layers.length && files['composite.png'], 'document.json・composite.png（exe と同じ形）');
+  ok(meta.layers.filter((e) => e.file === null).length === 3 && meta.layers.some((e) => e.mask_file), 'グループ・調整レイヤーは画素なし、マスクは masks/');
+  const { doc: d2 } = await docFromSko(sko, 'web_sample');
+  const diff = imageDiff(pixels(doc.flattened()), pixels(d2.flattened()));
+  ok(diff.max <= 3 && !d2.checkTree() && d2.layers.find((l) => l.isText).text.text === '彩工房', `書いて読んで同じ絵（最大差 ${diff.max}）・木・テキスト`);
+  const gray = await blobToImage(files[meta.layers.find((e) => e.mask_file).mask_file]);
+  const gc = newCanvas(gray.width, gray.height); ctx2d(gc).drawImage(gray, 0, 0);
+  const gp = ctx2d(gc).getImageData(230, 10, 1, 1).data, gq = ctx2d(gc).getImageData(10, 10, 1, 1).data;
+  ok(gp[3] === 255 && gp[0] > 240 && gq[0] < 10, 'マスクは灰色の PNG（白 = 見える）');
+
+  // 3) exe で作った .sko を開く（exe の合成結果と比べる）
+  const res = await fetch('/tools/fixtures/exe_sample.sko');
+  if (res.ok) {
+    const { doc: e, notes } = await docFromSko(await res.blob(), 'exe_sample');
+    const img = await blobToImage(await (await fetch('/tools/fixtures/exe_sample.png')).blob());
+    const c = newCanvas(img.width, img.height); ctx2d(c).drawImage(img, 0, 0);
+    const dd = imageDiff(pixels(e.flattened()), pixels(c));
+    ok(e.layers.length === 11 && !e.checkTree() && notes.length === 0, 'exe の .sko: 11 枚・グループ・調整・テキストを読める');
+    ok(dd.overPct < 0.1 && dd.mean < 1.5, `exe の合成と同じ絵（平均差 ${dd.mean.toFixed(2)}・最大差 ${dd.max}・8 を超える画素 ${dd.overPct.toFixed(2)}%）`);
+  } else out.push('SKIP exe_sample.sko が無い（python tools/make_sko_fixture.py で作る）');
+
+  // 4) Web の .sko を exe 用に置く
+  try {
+    const put = (name, blob) => fetch('/tools/fixtures/' + name, { method: 'PUT', body: blob }).then((r) => r.status);
+    const s1 = await put('web_sample.sko', sko), s2 = await put('web_sample.png', await canvasToBlob(doc.flattened()));
+    out.push(s1 === 201 && s2 === 201 ? 'INFO web_sample.sko を置いた → python tools/make_sko_fixture.py --check で exe と比べる' : 'SKIP 受け取りサーバーが無い（tools/devserver.py）');
+  } catch { out.push('SKIP 受け取りサーバーが無い'); }
+
+  // 5) 作品として開いて保存できる
+  const before = (await Store.list()).length;
+  await app.openFile(new File([sko], 'web_sample.sko'));
+  ok(app.doc && app.doc.name === 'web_sample' && app.doc.layers.length === doc.layers.length, 'ファイルを開く（.sko）で新しい作品になる');
+  await app.saveNow();
+  ok((await Store.list()).length === before + 1, '開いた作品は作品一覧に保存される');
+  const id = app.doc.workId;
+  await app.closeDoc(); await Store.remove(id); await app.showGallery();
+
+  const fails = out.filter((l) => l.startsWith('FAIL')).length;
+  return out.join('\n') + `\n---- ${out.filter((l) => l.startsWith('OK')).length} OK / ${fails} FAIL`;
+}

@@ -69,13 +69,27 @@ PSD は後回し（フェーズ4で検討）、16bit・ICC 変換（ブラウザ
 - マスク = 白・アルファ（見える度合い）の canvas。保存は exe と同じ灰色 PNG（`maskToGray` / `maskFromImage` は両形式を読める）。
   マスクへの描き込みは `paintMask`: destination-out で減らしてから lighter で白を足す（new = old·(1−a) + 灰色·a）。
   描く道具の描き込み先は `app.paintTarget()`（マスク編集中・調整レイヤー → マスク。調整レイヤーにマスクが無ければ自動で作る）。
-- スタイルは exe と同じ5種・同じ重ね順。ぼかしは canvas の影（shadowBlur = サイズ、σ = サイズ/2 で exe と同じ）を「本体は画面外・影だけ落とす」で使う。
-  境界線・スプレッドは距離変換（selection.js の distanceTransform）で太らせる・細らせる。
+- スタイルは exe と同じ5種・同じ重ね順・**同じ式**（ずらす＝双線形、太らせる・細らせる＝OpenCV の MORPH_ELLIPSE と同じ窓の
+  明るさの最大・最小（24px を超えると距離変換で代用）、ぼかし＝σ=サイズ/2 のガウス（外側は 0）、境界線は σ0.5 でなじませる）。
+  canvas の影（shadowBlur）で近似していた時は境界線が半ピクセル細く、光彩も最大 24 ずれていた。
 - テキストは exe と同じ spec（text, font, size, color, bold, italic, align, line_spacing, matrix）。行送り = (ascent+descent)·line_spacing。
   画素は spec から描き直す（移動・自由変形・画像全体の回転/拡大は行列を変えて描き直すのでぼやけない）。exe で描いた画素は直すまでそのまま。
   フォント名は exe（Windows）と iPad で違うので、無いものは「ヒラギノ角ゴ → 游ゴシック → sans-serif」に落ちる。
 - 「開いて値を変える」画面（スタイル・テキスト・調整レイヤー）は、開いた時の `doc.snapshot()` を持ち、値は直接レイヤーに入れて画面に出す。
   OK で `doc.commitFrom(label, before)` の1手、キャンセルで `doc.restore(before)`（履歴に残さない）。
+
+## 設計の要点（フェーズ4: .sko で exe と往復）
+- js/sko.js: 無圧縮 ZIP の読み書き（CRC32 自前、deflate の ZIP も DecompressionStream で読める）。中身は exe の save_native と同じ
+  （document.json・layers/・masks/（灰色）・selection.png・composite.png）。exe が読まない属性は extra として書き、読み込み時も保つ。
+- 開く: ファイル ＞ ファイルを開く（.sko・画像）／作品一覧の「ファイルを開く」。開いた .sko は新しい作品として IndexedDB に入る。
+  書き出し: ファイル ＞ 彩工房ファイル（.sko）で書き出し（iPad は共有シート →「ファイルに保存」で iCloud Drive など）。
+- **exe と同じ絵になるかの確かめ方**（2026-10-17 時点: exe→Web 平均差 0.63・最大 9、Web→exe 平均差 0.21・最大 6、8 を超える画素 0%）:
+  1. `python tools/make_sko_fixture.py` … exe のコードで「グループ・通過・クリッピング・マスク・調整・スタイル・テキスト」入りの
+     exe_sample.sko と exe の合成 PNG を tools/fixtures/ に作る
+  2. プレビューで `saikoboSelfTest4()` … exe_sample を開いて比べ、Web で作った web_sample.sko を PUT で fixtures に置く
+  3. `python tools/make_sko_fixture.py --check tools/fixtures/web_sample.sko tools/fixtures/web_sample.png` … exe で開いて合成して比べる
+- 開発サーバーは `tools/devserver.py`（キャッシュさせない＋ fixtures への PUT を受け取る。127.0.0.1 だけ）。launch.json の saikobo-web がこれ。
+  素の http.server だと直した js が古いまま読まれることがあった（Cache-Control が無いので）。
 
 ## ハマり所（実測）
 - **Uint8ClampedArray は代入時に四捨五入する**（偶数丸め）。`v + 0.5` を足すと半段ずれる（反転で 127 が 128 になった）。
@@ -91,11 +105,12 @@ PSD は後回し（フェーズ4で検討）、16bit・ICC 変換（ブラウザ
 ## テスト
 - `tools/selftest.js`: 疑似的なペン・タッチ入力で確かめる。`saikoboSelfTest()`（フェーズ1: 描画・ジェスチャー・選択・移動・レイヤー・
   画像操作・保存/読み込み 30項目）と `saikoboSelfTest2()`（フェーズ2: ペンの種類・補正パネル・フィルター・自由変形・切り抜き 24項目）、
-  `saikoboSelfTest3()`（フェーズ3: マスク・クリッピング・グループ・調整レイヤー・スタイル・テキスト・保存の往復 37項目）。
+  `saikoboSelfTest3()`（フェーズ3: マスク・クリッピング・グループ・調整レイヤー・スタイル・テキスト・保存の往復 37項目）、
+  `saikoboSelfTest4()`（フェーズ4: ZIP・.sko の往復・exe の .sko との比較 11項目）。
   プレビューで `<script src="/tools/selftest.js">` を読み込んでから await で呼ぶ。終わると作った作品は消す。
 - exe と同じ結果か: `python tools/make_fixtures.py` → プレビューで fixtures/input.png に `findSpec(key).fn` をかけ、index.json の各期待値 PNG と不透明部分の差を見る（2026-10-16 時点で ±1）。
 - アイコン: `python tools/make_icons.py`（exe 版と同じ絵）
 
 ## 起動・確認
-- 開発: `APP/.claude/launch.json` の `saikobo-web`（port 8674）。localhost では sw.js を登録しない（`?sw=1` で強制）。
+- 開発: `APP/.claude/launch.json` の `saikobo-web`（port 8674、tools/devserver.py）。localhost では sw.js を登録しない（`?sw=1` で強制）。
 - 更新時は `sw.js` の VERSION と `js/app.js` の APP_VERSION を両方上げる。
