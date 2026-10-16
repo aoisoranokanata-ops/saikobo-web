@@ -1,7 +1,7 @@
 'use strict';
 /* アプリ本体: 画面の切り替え・コマンド・メニュー・キーボード・自動保存 */
 
-const APP_VERSION = '0.2.0';
+const APP_VERSION = '0.2.1';
 
 class App {
   constructor() {
@@ -162,7 +162,18 @@ class App {
     this.settle({ commit: false });
     if (this.tool && this.tool.deactivate) { this.tool.deactivate(); this.toolName = this.prevTool || 'brush'; }
     this.autosave.cancel();
+    clearTimeout(this._retryT);
+    const doc = this.doc;
     await this.saveNow();
+    if (doc && this.isDirty(doc)) {            // 閉じる時だけは、保存できていないことをはっきり知らせる
+      await this.saveNow();
+      if (this.isDirty(doc)) {
+        const r = await openDialog({ title: '保存できませんでした', message: `この作品の最後の変更を端末に保存できませんでした。\n（${doc._saveError || '原因不明'}）\n\n書き出しておくと安全です。`,
+          buttons: [{ label: 'このまま閉じる', value: 'close' }, { label: 'PNG で書き出す', value: 'png', primary: true }] });
+        if (r && r.button === 'png') { try { await saveBlob(await canvasToBlob(doc.flattened()), safeName(doc.name) + '.png'); } catch { /* */ } }
+      }
+    }
+    this.saveState('ok');
     this.doc = null;
     this._scratch = {};
     Store.blobCache.clear();
@@ -224,17 +235,34 @@ class App {
     return this._saveChain;
   }
   isDirty(doc = this.doc) { return !!doc && doc.rev !== doc._savedRev; }
+  /** 保存する。失敗しても描いている最中は知らせず、上のバーの印だけ出して少し後にやり直す */
   async _save(doc) {
-    if (!this.isDirty(doc) && doc.workId) return;
+    if (!this.isDirty(doc) && doc.workId) return true;
     const rev = doc.rev;
     try {
       await Store.saveDoc(doc, { fg: this.fg, bg: this.bg });
       doc._savedRev = rev;
+      doc._saveFails = 0;
       if (this.doc === doc) LS.set('lastWork', doc.workId);
+      this.saveState('ok');
+      return true;
     } catch (e) {
-      console.error(e);
-      toast('保存できませんでした: ' + (e && e.message ? e.message : e) + '\n（容量が足りない場合は、作品一覧から古い作品を書き出して削除してください）', { error: true });
+      console.warn('保存に失敗（あとでやり直す）', e);
+      doc._saveFails = (doc._saveFails || 0) + 1;
+      doc._saveError = (e && (e.message || e.name)) || String(e);
+      if (this.doc === doc) {
+        this.saveState('fail');
+        clearTimeout(this._retryT);
+        this._retryT = setTimeout(() => { if (this.doc === doc && this.isDirty(doc)) this.saveNow(); }, Math.min(30000, 3000 * doc._saveFails));
+      }
+      return false;
     }
+  }
+  /** 上のバーの保存状態の印（失敗中だけ出す。押すと詳しく） */
+  saveState(state) {
+    const b = $('#saveState');
+    if (!b) return;
+    b.hidden = state !== 'fail';
   }
 
   // ---- ギャラリー
@@ -247,7 +275,7 @@ class App {
     grid.replaceChildren();
     $('#galEmpty').hidden = works.length > 0;
     for (const w of works) {
-      const url = w.thumb ? URL.createObjectURL(w.thumb) : '';
+      const url = w.thumb ? URL.createObjectURL(unpackBlob(w.thumb)) : '';
       if (url) this._thumbUrls.push(url);
       const more = el('button', { class: 'more', 'aria-label': 'その他' }, '⋯');
       const card = el('div', { class: 'work' },
@@ -553,7 +581,7 @@ class App {
       'file.jpeg': () => this.exportDialog('jpeg'),
       'file.rename': async () => { const n = await promptDialog('作品名', d.name); if (n && n.trim()) { d.name = n.trim(); $('#docTitle').textContent = d.name; d.emit('meta'); this.saveNow(); } },
       'file.duplicate': async () => { await this.saveNow(); const id = await Store.duplicate(d.workId); if (id) { await this.closeDoc(); this.openWork(id); toast('複製を開きました'); } },
-      'file.save': () => this.saveNow().then(() => toast('保存しました', { ms: 1000 })),
+      'file.save': () => this.saveNow().then(() => toast(this.isDirty() ? '保存できませんでした。少し後にもう一度保存します' : '保存しました', { ms: 1600 })),
       'file.gallery': () => this.showGallery(),
       'edit.undo': () => this.undo(),
       'edit.redo': () => this.redo(),
@@ -716,6 +744,11 @@ class App {
         buttons: [{ label: '閉じる', value: 'ok', primary: true }] }) },
     ]));
     $('#btnBack').addEventListener('click', () => this.showGallery());
+    $('#saveState').addEventListener('click', () => {
+      const d = this.doc;
+      openDialog({ title: '保存を再試行しています', message: `端末への保存がうまくいっていません。自動でやり直しています。\n（${d && d._saveError ? d._saveError : ''}）\n\n続く場合は「ファイル ＞ PNG で書き出し」で書き出しておいてください。`,
+        buttons: [{ label: '閉じる', value: 'cancel' }, { label: '今すぐ保存', value: 'ok', primary: true }] }).then((r) => { if (r) this.cmd('file.save'); });
+    });
     $('#btnUndo').addEventListener('click', () => this.undo());
     $('#btnRedo').addEventListener('click', () => this.redo());
     $('#btnSide').addEventListener('click', () => this.cmd('view.side'));

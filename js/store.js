@@ -1,13 +1,23 @@
 'use strict';
 /* 作品の保存（IndexedDB "saikobo-web"）。
-   works: {id, name, width, height, created, updated, thumb: Blob, bytes}
-   data : {id, meta, files: {パス: Blob}}  meta は exe 版 .sko の document.json と同じ形 */
+   works: {id, name, width, height, created, updated, thumb, bytes}
+   data : {id, meta, files: {パス: 画像}}  meta は exe 版 .sko の document.json と同じ形
+   画像は {type, buf: ArrayBuffer} で入れる（Blob のままだと iPad の Safari で
+   「Error preparing Blob/File data」で保存に失敗することがある）。古い Blob の保存分も読める。 */
+
+/** 保存用の形 ⇔ Blob */
+async function packBlob(blob) { return { type: blob.type || 'image/png', buf: await blob.arrayBuffer() }; }
+function unpackBlob(v) {
+  if (!v) return null;
+  if (v instanceof Blob) return v;
+  return new Blob([v.buf], { type: v.type || 'image/png' });
+}
 
 const SKO_FORMAT_VERSION = 4;
 
 const Store = {
   db: null,
-  blobCache: new Map(),      // layer.id → {canvas, ver, blob}（変わっていないレイヤーは PNG を作り直さない）
+  blobCache: new Map(),      // layer.id → {canvas, ver, packed}（変わっていないレイヤーは PNG を作り直さない）
 
   open() {
     if (this.db) return Promise.resolve(this.db);
@@ -18,18 +28,39 @@ const Store = {
         if (!db.objectStoreNames.contains('works')) db.createObjectStore('works', { keyPath: 'id' });
         if (!db.objectStoreNames.contains('data')) db.createObjectStore('data', { keyPath: 'id' });
       };
-      rq.onsuccess = () => { this.db = rq.result; res(this.db); };
+      rq.onsuccess = () => {
+        const db = rq.result;
+        db.onclose = () => { if (this.db === db) this.db = null; };          // iOS は裏に回ると接続を切ることがある
+        db.onversionchange = () => { db.close(); if (this.db === db) this.db = null; };
+        this.db = db;
+        res(db);
+      };
       rq.onerror = () => rej(rq.error || new Error('保存領域を開けません'));
     });
   },
-  tx(stores, mode, fn) {
+  /** 1回分の処理。接続が切れていたら開き直して1回だけやり直す */
+  async tx(stores, mode, fn) {
+    try { return await this._tx(stores, mode, fn); } catch (e) {
+      if (e && (e.name === 'InvalidStateError' || e.name === 'UnknownError' || /connection|closing|lost/i.test(e.message || ''))) {
+        try { this.db && this.db.close(); } catch { /* 閉じられなくてよい */ }
+        this.db = null;
+        return this._tx(stores, mode, fn);
+      }
+      throw e;
+    }
+  },
+  _tx(stores, mode, fn) {
     return this.open().then((db) => new Promise((res, rej) => {
-      const t = db.transaction(stores, mode);
-      let out;
+      let t;
+      try { t = db.transaction(stores, mode); } catch (e) { rej(e); return; }
+      let out, reqErr = null;
       t.oncomplete = () => res(out);
-      t.onerror = () => rej(t.error || new Error('保存に失敗しました'));
-      t.onabort = () => rej(t.error || new Error('保存が中断されました（容量不足の可能性）'));
-      out = fn(...stores.map((s) => t.objectStore(s)));
+      t.onerror = (ev) => { reqErr = (ev && ev.target && ev.target.error) || reqErr; };
+      t.onabort = () => {
+        const e = t.error || reqErr;
+        rej(e || new Error('保存が中断されました（容量不足の可能性）'));
+      };
+      try { out = fn(...stores.map((s) => t.objectStore(s))); } catch (e) { try { t.abort(); } catch { /* */ } rej(e); }
     }));
   },
   req(r) { return new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); },
@@ -62,22 +93,23 @@ const Store = {
       if (l.id === doc.activeId) meta.active = i;
       let c = this.blobCache.get(l.id);
       if (!c || c.canvas !== l.canvas || c.ver !== l.ver) {
-        c = { canvas: l.canvas, ver: l.ver, blob: await canvasToBlob(l.canvas) };
+        const ver = l.ver, canvas = l.canvas;
+        c = { canvas, ver, packed: await packBlob(await canvasToBlob(canvas)) };
         this.blobCache.set(l.id, c);
       }
-      files[path] = c.blob;
-      bytes += c.blob.size;
+      files[path] = c.packed;
+      bytes += c.packed.buf.byteLength;
     }
     if (doc.sel) {
-      files['selection.png'] = await canvasToBlob(doc.sel.canvas);
+      files['selection.png'] = await packBlob(await canvasToBlob(doc.sel.canvas));
       meta.selection = 'selection.png';
     }
-    const thumb = await this.makeThumb(doc);
+    const thumb = await packBlob(await this.makeThumb(doc));
     const now = Date.now();
     const prev = await this.getWork(doc.workId);
     const work = {
       id: doc.workId, name: doc.name, width: doc.width, height: doc.height,
-      created: prev ? prev.created : now, updated: now, thumb, bytes: bytes + thumb.size,
+      created: prev ? prev.created : now, updated: now, thumb, bytes: bytes + thumb.buf.byteLength,
     };
     await this.tx(['works', 'data'], 'readwrite', (w, d) => {
       w.put(work);
@@ -98,7 +130,9 @@ const Store = {
   async loadDoc(id) {
     const [work, data] = await this.tx(['works', 'data'], 'readonly', (w, d) => Promise.all([this.req(w.get(id)), this.req(d.get(id))]));
     if (!work || !data) throw new Error('作品が見つかりません');
-    const doc = await docFromMeta(data.meta, data.files, { name: work.name });
+    const files = {};
+    for (const [k, v] of Object.entries(data.files || {})) files[k] = unpackBlob(v);
+    const doc = await docFromMeta(data.meta, files, { name: work.name });
     doc.workId = id;
     for (const l of doc.layers) this.blobCache.delete(l.id);
     return { doc, web: data.meta.web || {} };

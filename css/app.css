@@ -79,6 +79,7 @@ button { cursor: pointer; }
 .tb-btn:disabled { opacity: .35; }
 .tb-title { flex: 1; text-align: center; color: var(--fg2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; padding: 0 8px; }
 .tb-right { display: flex; gap: 2px; }
+.save-state { background: none; border: 1px solid #b8862b; color: #f0b44a; border-radius: 10px; font-size: 12px; padding: 1px 8px; margin-left: 8px; }
 
 #optbar {
   height: var(--opt-h); display: flex; align-items: center; gap: 14px; padding: 0 calc(10px + var(--safe-r)) 0 calc(10px + var(--safe-l));
