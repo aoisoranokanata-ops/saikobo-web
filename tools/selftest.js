@@ -178,3 +178,150 @@ async function saikoboSelfTest() {
   const fails = out.filter((l) => l.startsWith('FAIL')).length;
   return out.join('\n') + `\n---- ${out.length - fails} OK / ${fails} FAIL`;
 }
+
+
+/* フェーズ2: ペンの種類・色調補正パネル・フィルター・自由変形・切り抜き */
+async function saikoboSelfTest2() {
+  const out = [];
+  const ok = (cond, msg) => { out.push((cond ? 'OK   ' : 'FAIL ') + msg); };
+  const wait = (ms = 30) => new Promise((r) => setTimeout(r, ms));
+  const view = app.view, cv = view.canvas;
+  const scr = (x, y) => { const r = cv.getBoundingClientRect(); const s = view.toScreen(x, y); return { clientX: r.left + s.x, clientY: r.top + s.y }; };
+  let pid = 500;
+  const fire = (type, id, pointerType, pos, extra = {}) => cv.dispatchEvent(new PointerEvent(type, {
+    pointerId: id, pointerType, bubbles: true, cancelable: true, isPrimary: true, buttons: type === 'pointerup' ? 0 : 1, button: 0,
+    pressure: type === 'pointerup' ? 0 : (extra.pressure ?? 0.7), ...pos, ...extra,
+  }));
+  const stroke = async (pts, pointerType = 'mouse', extra = {}) => {
+    const id = ++pid;
+    fire('pointerdown', id, pointerType, scr(...pts[0]), extra);
+    for (const p of pts.slice(1)) { fire('pointermove', id, pointerType, scr(...p), extra); await wait(4); }
+    fire('pointerup', id, pointerType, scr(...pts[pts.length - 1]), extra);
+    await wait(20);
+  };
+  const px = (layer, x, y) => Array.from(layer.ctx.getImageData(x, y, 1, 1).data);
+  const alphaCount = (c, r) => { const d = c.getContext('2d').getImageData(r.x, r.y, r.w, r.h).data; let n = 0; for (let i = 3; i < d.length; i += 4) if (d[i]) n++; return n; };
+
+  if (app.doc) await app.closeDoc();
+  const doc = new Doc(400, 300, { name: '自己テスト2', background: '#808080' });
+  doc.history.clear('新規');
+  app.openDoc(doc);
+  await wait(50);
+  const bg = doc.layers[0];
+
+  // 1) ペンの種類
+  app.cmd('layer.new');
+  const ink = doc.active;
+  app.selectTool('brush');
+  const brush = app.tools.brush;
+  const keep = { ...brush.opts };
+  brush.setPreset('gpen'); brush.opts.size = 20; brush.opts.smoothing = 0;
+  app.setFg('#000000', { recent: false });
+  const pts = []; for (let i = 0; i <= 20; i++) pts.push([40 + i * 10, 60]);
+  // 筆圧を入り抜きにする
+  { const id = ++pid; fire('pointerdown', id, 'pen', scr(...pts[0]), { pressure: 0.02 });
+    for (let i = 1; i < pts.length; i++) { fire('pointermove', id, 'pen', scr(...pts[i]), { pressure: Math.sin(i / 20 * Math.PI) }); await wait(3); }
+    fire('pointerup', id, 'pen', scr(...pts[20])); await wait(20); }
+  const thick = (x) => { let n = 0; for (let y = 40; y < 80; y++) if (px(ink, x, y)[3] > 128) n++; return n; };
+  ok(thick(140) > thick(50) + 6 && thick(50) <= 4, `Gペン: 入り抜きで細く・中央で太い（端 ${thick(50)}px / 中央 ${thick(140)}px）`);
+  brush.setPreset('pencil'); brush.opts.size = 30;
+  await stroke([[40, 150], [360, 150]], 'pen', { pressure: 1 });
+  let holes = 0, solid = 0;
+  for (let x = 60; x < 340; x += 3) { const a = px(ink, x, 150)[3]; if (a < 200) holes++; else solid++; }
+  ok(holes > 10 && solid > 10, `鉛筆: 紙の質感で塗りにむらがある（抜け ${holes} / 濃い ${solid}）`);
+  brush.setPreset('marker');
+  ok(brush.opts.opacity === 60 && brush.opts.pressureSize === false, 'マーカー: 不透明度 60%・筆圧でサイズ変えない');
+  brush.setPreset('round');
+  ok(brush.opts.opacity === 100, '標準ペンに戻すと不透明度 100%');
+  Object.assign(brush.opts, keep); LS.set('tool.brush', brush.opts);
+
+  // 2) 色調補正パネル（プレビュー → OK で1手）
+  doc.setActive(bg);
+  const n0 = doc.history.pos;
+  app.cmd('adj.brightness_contrast');
+  ok(app.adjust.open && !$('#adjPanel').hidden, '色調補正パネルが開く');
+  app.adjust.params.brightness = 80;
+  app.adjust.compute();
+  const prevPx = Array.from(ctx2d(doc.live.canvas).getImageData(10, 10, 1, 1).data);
+  ok(prevPx[0] > 160 && px(bg, 10, 10)[0] === 128, 'プレビューは作業用だけ（レイヤーはまだ変わらない）');
+  app.adjust.ok();
+  ok(px(bg, 10, 10)[0] > 160 && doc.history.pos === n0 + 1 && doc.history.list[doc.history.pos - 1].label === '明るさ・コントラスト', 'OK で反映・履歴1手');
+  app.undo();
+  ok(px(bg, 10, 10)[0] === 128, '取り消せる');
+  app.cmd('adj.hue_saturation');
+  app.adjust.params.saturation = 50;
+  app.adjust.compute();
+  app.adjust.cancel();
+  ok(!app.adjust.open && px(bg, 10, 10)[0] === 128 && doc.live === null && doc.history.pos === n0, 'キャンセルで元のまま');
+  // 選択範囲の中だけ
+  doc.setSelection(Sel.combine(null, Sel.shape(400, 300, (g) => g.rect(0, 0, 200, 300)), 'replace', 400, 300));
+  app.cmd('adj.invert');
+  ok(px(bg, 10, 10)[0] === 127 && px(bg, 300, 10)[0] === 128, '階調の反転は選択範囲の中だけ');
+  app.undo(); app.cmd('select.none');
+  // トーンカーブ（点をつかんで動かす）
+  app.cmd('adj.curves');
+  app.adjust.params.points = [[0, 0], [128, 200], [255, 255]];
+  app.adjust.ok();
+  ok(px(bg, 10, 10)[0] > 190, 'トーンカーブ');
+  app.undo();
+  // フィルター（ぼかしは境目だけ変わる）
+  ink.ctx.clearRect(0, 0, 400, 300); ink.ctx.fillStyle = '#ff0000'; ink.ctx.fillRect(100, 100, 100, 100); ink.ver++; doc.invalidate();
+  doc.setActive(ink);
+  app.cmd('adj.gaussian_blur');
+  app.adjust.params.radius = 5;
+  app.adjust.ok();
+  const edge = px(ink, 100, 150), inside = px(ink, 150, 150);
+  ok(edge[3] > 60 && edge[3] < 200 && inside[3] === 255 && inside[0] === 255, 'ぼかし（ガウス）: 境目だけなめらかに・色は赤のまま');
+  ok(!!app.lastFilter && app.lastFilter.key === 'gaussian_blur', '前回のフィルターを覚える');
+  app.undo();
+
+  // 3) 自由変形
+  app.selectTool('transform');
+  const T = app.tools.transform;
+  ok(!!T.state && T.state.bounds.w === 100, '自由変形: 中身の範囲で始まる');
+  // 右下の角を外へ（縦横比固定で 2 倍）
+  await stroke([[200, 200], [250, 250], [300, 300]]);
+  const q = T.state.quad;
+  ok(Math.abs(q[2].x - 300) < 1 && Math.abs(q[2].y - 300) < 1 && Math.abs(q[0].x - 100) < 1, '角をドラッグで拡大（反対の角は固定）');
+  T.commit();
+  ok(!T.state && app.toolName !== 'transform' && alphaCount(ink.canvas, { x: 0, y: 0, w: 400, h: 300 }) > 35000, '確定で反映して前の道具に戻る');
+  app.undo();
+  ok(alphaCount(ink.canvas, { x: 0, y: 0, w: 400, h: 300 }) === 10000, '自由変形を取り消せる');
+  // 回転（外側をドラッグ）→ 90°
+  app.selectTool('transform');
+  await stroke([[150, 60], [240, 150]], 'mouse', { shiftKey: true });
+  const ang = Math.atan2(T.state.quad[1].y - T.state.quad[0].y, T.state.quad[1].x - T.state.quad[0].x) * 180 / Math.PI;
+  ok(Math.abs(ang - 90) < 0.01, `外側をドラッグで回転（Shift で 15° 刻み: ${ang.toFixed(2)}°）`);
+  T.cancelAll();
+  ok(!T.state && doc.live === null && alphaCount(ink.canvas, { x: 0, y: 0, w: 400, h: 300 }) === 10000, '変形のキャンセル');
+  // 遠近
+  app.selectTool('transform');
+  T.setOpt('mode', 'distort');
+  await stroke([[100, 100], [60, 80]]);
+  T.commit();
+  const area = alphaCount(ink.canvas, { x: 0, y: 0, w: 400, h: 300 });
+  ok(area > 10500 && area < 14000, `自由な形（遠近）で角だけ動かせる（面積 ${area}）`);
+  T.setOpt('mode', 'scale');
+  app.undo();
+
+  // 4) 切り抜きツール
+  app.selectTool('crop');
+  const C = app.tools.crop;
+  ok(C.rect && C.rect.w === 400, '切り抜き: 最初は全体');
+  await stroke([[400, 300], [300, 250]]);              // 右下の角を内側へ
+  ok(Math.round(C.rect.w) === 300 && Math.round(C.rect.h) === 250, '角をドラッグで範囲を決める');
+  C.setOpt('ratio', '1:1'); C.optChanged('ratio');
+  ok(Math.round(C.rect.w) === Math.round(C.rect.h), '比率 1:1');
+  C.commit();
+  ok(doc.width === 300 && doc.height === 300, `切り抜いた（${doc.width}×${doc.height}）`);
+  app.undo();
+  C.setOpt('ratio', 'free');
+  app.selectTool('brush');
+
+  const id = doc.workId;
+  await app.closeDoc();
+  await Store.remove(id);
+  await app.showGallery();
+  const fails = out.filter((l) => l.startsWith('FAIL')).length;
+  return out.join('\n') + `\n---- ${out.length - fails} OK / ${fails} FAIL`;
+}

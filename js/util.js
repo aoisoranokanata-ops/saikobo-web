@@ -246,6 +246,7 @@ async function promptDialog(title, value = '', label = '名前') {
 function openMenu(anchor, items, { onClose } = {}) {
   const layer = $('#menuLayer'), pop = $('#menuPop');
   pop.replaceChildren();
+  pop.classList.remove('pop-custom');
   for (const it of items) {
     if (it === '-') { pop.append(el('div', { class: 'menu-sep' })); continue; }
     if (it.head) { pop.append(el('div', { class: 'menu-head' }, it.head)); continue; }
@@ -270,6 +271,30 @@ function openMenu(anchor, items, { onClose } = {}) {
     onClose && onClose();
   }
   function onKey(e) { if (e.key === 'Escape') { e.stopPropagation(); close(); } }
+  layer.onpointerdown = (e) => { if (e.target === layer) close(); };
+  document.addEventListener('keydown', onKey, true);
+  return close;
+}
+
+/** ボタンの下に任意の中身を出す（ペンの種類など）。戻り値は閉じる関数 */
+function openPopover(anchor, content) {
+  const layer = $('#menuLayer'), pop = $('#menuPop');
+  pop.replaceChildren(content);
+  pop.classList.add('pop-custom');
+  layer.hidden = false;
+  const r = anchor.getBoundingClientRect();
+  const pw = pop.offsetWidth, ph = pop.offsetHeight;
+  let x = r.left, y = r.bottom + 4;
+  if (x + pw > innerWidth - 8) x = Math.max(8, innerWidth - 8 - pw);
+  if (y + ph > innerHeight - 8) y = Math.max(8, r.top - ph - 4);
+  pop.style.left = x + 'px'; pop.style.top = y + 'px';
+  const close = () => {
+    layer.hidden = true;
+    pop.classList.remove('pop-custom');
+    layer.onpointerdown = null;
+    document.removeEventListener('keydown', onKey, true);
+  };
+  const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); close(); } };
   layer.onpointerdown = (e) => { if (e.target === layer) close(); };
   document.addEventListener('keydown', onKey, true);
   return close;

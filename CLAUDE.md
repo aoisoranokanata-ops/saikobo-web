@@ -43,7 +43,25 @@ PSD は後回し（フェーズ4で検討）、16bit・ICC 変換（ブラウザ
 4. 互換: .sko 読み書き（exe と往復）、必要なら PSD
 5. 仕上げ: iPad 実機での描き味・性能調整、README
 
+## 設計の要点（フェーズ2）
+- ペンの種類 = `BRUSH_PRESETS`（tools.js）。筆圧→太さは `min + (1-min)·p^gamma`、1点の濃さ = flow、紙の質感 = grain。
+  質感は**紙に固定した模様**（256px のつなぎ目無しノイズ）で筆跡を destination-out で削る（applyTo の中、プレビューも確定も同じ）。
+  種類を選ぶと硬さ・筆圧の設定もその種類の標準に変わる（サイズは変えない、マーカーだけ不透明度 60%）。
+- 色調補正・フィルター（js/adjust.js）は **exe 版 core/adjust.py と同じキー・同じ引数・同じ式**（フェーズ3の調整レイヤーと .sko 往復で使う）。
+  `tools/make_fixtures.py` が exe の結果を PNG にし、Web 版と比べると不透明部分の差は ±1（色相・彩度は量子化で最大7、輪郭検出は端の扱いで端だけ差）。
+  Web 版だけの追加: 色温度・色かぶり（`color_temperature`、exe には無いので調整レイヤーにするときは注意）。
+  exe にあって Web に無い: ノイズを軽減（NLMeans）。
+- 補正パネル（js/adjustui.js）は絵の上に浮かぶ非モーダル。プレビューは作業用 canvas（doc.live）に書くだけで、OK で editPixels 1手。
+  選択範囲があればその範囲だけ・アルファで元と混ぜる（`runSpec`、ぼかし系は pad だけ外側も読む）。
+  開いている間は描けない・取り消しはパネルを閉じる・ほかのコマンドの前に閉じる（`app.settle()`）。
+- 自由変形・切り抜きは「選んでいる間だけ状態を持つ道具」（activate / deactivate）。変形は四角形 quad（左上・右上・右下・左下）で持ち、
+  平行四辺形なら canvas の transform 1回、そうでなければ射影変換を n×n の三角形に分けて描く（隙間対策で三角形を 0.7px 広げる）。
+  確定は新しい canvas に差し替える change 1手、選択範囲も同じ変換。確定・キャンセル後は前の道具に戻る（prevTool）。
+
 ## ハマり所（実測）
+- **Uint8ClampedArray は代入時に四捨五入する**（偶数丸め）。`v + 0.5` を足すと半段ずれる（反転で 127 が 128 になった）。
+  Uint8Array（切り捨て）とは違うので、書き込み先の型で丸め方を変えること。
+- フレックスの中の要素は、はみ出すと縮んで消える → オプションバーは `#optbar > * { flex-shrink: 0 }` で横スクロールにした。
 - **Canvas の destination-in / source-in / copy は、描いた画像の範囲の外も消す**（範囲外のソースは透明扱い）。
   一部の範囲だけに効かせたいときは先に `clip()` で範囲を絞る（ブラシの選択範囲切り抜きで一度やらかした）。
 - 引数の既定値は `undefined` を渡すと効いてしまう → 「レイヤー無しで作る」は `new Doc(w, h, {empty: true})`。
@@ -52,8 +70,10 @@ PSD は後回し（フェーズ4で検討）、16bit・ICC 変換（ブラウザ
 - プレビューのペインが隠れていると requestAnimationFrame が来ない → 自己テストは setTimeout で待つ。
 
 ## テスト
-- `tools/selftest.js`: 疑似的なペン・タッチ入力で描画・ジェスチャー・選択・移動・レイヤー・画像操作・保存/読み込みを確かめる（30項目）。
-  プレビューで `<script src="/tools/selftest.js">` を読み込んでから `await saikoboSelfTest()`。終わると作った作品は消す。
+- `tools/selftest.js`: 疑似的なペン・タッチ入力で確かめる。`saikoboSelfTest()`（フェーズ1: 描画・ジェスチャー・選択・移動・レイヤー・
+  画像操作・保存/読み込み 30項目）と `saikoboSelfTest2()`（フェーズ2: ペンの種類・補正パネル・フィルター・自由変形・切り抜き 24項目）。
+  プレビューで `<script src="/tools/selftest.js">` を読み込んでから await で呼ぶ。終わると作った作品は消す。
+- exe と同じ結果か: `python tools/make_fixtures.py` → プレビューで fixtures/input.png に `findSpec(key).fn` をかけ、index.json の各期待値 PNG と不透明部分の差を見る（2026-10-16 時点で ±1）。
 - アイコン: `python tools/make_icons.py`（exe 版と同じ絵）
 
 ## 起動・確認

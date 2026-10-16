@@ -39,8 +39,10 @@
       <button class="tb-btn" data-menu="file">ファイル</button>
       <button class="tb-btn" data-menu="edit">編集</button>
       <button class="tb-btn" data-menu="image">イメージ</button>
+      <button class="tb-btn" data-menu="adjust">色調補正</button>
       <button class="tb-btn" data-menu="layer">レイヤー</button>
       <button class="tb-btn" data-menu="select">選択範囲</button>
+      <button class="tb-btn" data-menu="filter">フィルター</button>
       <button class="tb-btn" data-menu="view">表示</button>
     </nav>
     <div class="tb-title" id="docTitle"></div>
@@ -57,6 +59,7 @@
       <canvas id="view"></canvas>
       <div id="zoomBadge" class="badge" hidden></div>
       <div id="hint" class="hint" hidden></div>
+      <div id="adjPanel" class="adj-panel" hidden></div>
     </div>
     <aside id="side">
       <div class="side-tabs">
@@ -113,6 +116,9 @@
 <script src="js/selection.js"></script>
 <script src="js/view.js"></script>
 <script src="js/tools.js"></script>
+<script src="js/transform.js"></script>
+<script src="js/adjust.js"></script>
+<script src="js/adjustui.js"></script>
 <script src="js/panels.js"></script>
 <script src="js/store.js"></script>
 <script src="js/app.js"></script>

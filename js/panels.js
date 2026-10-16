@@ -34,11 +34,25 @@ function buildOptbar(app) {
   bar.replaceChildren(el('span', { class: 'opt-title' }, tool.label));
   for (const s of tool.spec()) {
     if (s.type === 'note') { bar.append(el('span', { class: 'opt' }, s.text)); continue; }
+    if (s.type === 'preset') {
+      const b = el('button', { class: 'opt-btn preset-btn' }, el('span', { class: 'opt-dim' }, tool.eraser ? '種類 ' : 'ペン '), tool.preset.label, ' ▾');
+      b.addEventListener('click', () => openPresetPicker(app, tool, b));
+      bar.append(b);
+      continue;
+    }
+    if (s.type === 'buttons') {
+      for (const [label, fn, cls] of s.items) {
+        const b = el('button', { class: 'opt-btn' + (cls ? ' ' + cls : '') }, label);
+        b.addEventListener('click', fn);
+        bar.append(b);
+      }
+      continue;
+    }
     if (s.type === 'seg') {
       const seg = el('div', { class: 'seg' });
       for (const [v, l] of s.items) {
         const b = el('button', { class: tool.opts[s.key] === v ? 'on' : '' }, l);
-        b.addEventListener('click', () => { tool.setOpt(s.key, v); buildOptbar(app); });
+        b.addEventListener('click', () => { tool.setOpt(s.key, v); tool.optChanged && tool.optChanged(s.key); buildOptbar(app); });
         seg.append(b);
       }
       bar.append(seg);
@@ -46,8 +60,15 @@ function buildOptbar(app) {
     }
     if (s.type === 'check') {
       const cb = el('input', { type: 'checkbox', checked: !!tool.opts[s.key] });
-      cb.addEventListener('change', () => tool.setOpt(s.key, cb.checked));
+      cb.addEventListener('change', () => { tool.setOpt(s.key, cb.checked); tool.optChanged && tool.optChanged(s.key); });
       bar.append(el('label', { class: 'opt' }, cb, s.label));
+      continue;
+    }
+    if (s.type === 'select') {
+      const sel = el('select', {});
+      for (const [v, l] of s.items) sel.append(el('option', { value: v, selected: tool.opts[s.key] === v }, l));
+      sel.addEventListener('change', () => { tool.setOpt(s.key, sel.value); tool.optChanged && tool.optChanged(s.key); buildOptbar(app); });
+      bar.append(el('label', { class: 'opt' }, s.label, sel));
       continue;
     }
     if (s.type === 'range') {
@@ -77,8 +98,57 @@ function buildOptbar(app) {
     const p = el('button', { class: 'opt-btn' }, '＋');
     b.addEventListener('click', () => app.brushSize(-1));
     p.addEventListener('click', () => app.brushSize(1));
-    bar.children[1].after(b, p);
+    bar.children[2].after(b, p);
   }
+}
+
+/** ペンの種類を、筆跡の見本つきで選ぶ */
+function openPresetPicker(app, tool, anchor) {
+  const grid = el('div', { class: 'preset-grid' });
+  let close = null;
+  for (const key of tool.presetKeys()) {
+    const p = BRUSH_PRESETS[key];
+    const c = el('canvas', { width: 300, height: 84 });
+    drawPresetSample(c, p);
+    const b = el('button', { class: 'preset-item' + (tool.opts.kind === key ? ' on' : '') }, c, el('span', {}, p.label));
+    b.addEventListener('click', () => { tool.setPreset(key); buildOptbar(app); close && close(); });
+    grid.append(b);
+  }
+  close = openPopover(anchor, grid);
+}
+/** 見本の筆跡（S字・入り抜きのある筆圧）を描く */
+function drawPresetSample(c, p) {
+  const g = ctx2d(c);
+  const W = c.width, H = c.height;
+  const buf = newCanvas(W, H), bg = ctx2d(buf);
+  const S = 64, tip = newCanvas(S, S), tg = ctx2d(tip);
+  const h = p.hardness / 100, inner = Math.min(0.97, h);
+  const grad = tg.createRadialGradient(S / 2, S / 2, 0, S / 2, S / 2, S / 2);
+  grad.addColorStop(0, '#eeeeee'); grad.addColorStop(inner, '#eeeeee');
+  for (let i = 1; i <= 6; i++) { const t = i / 6; grad.addColorStop(Math.min(1, inner + (1 - inner) * t), `rgba(238,238,238,${(1 - t * t * (3 - 2 * t)).toFixed(3)})`); }
+  tg.fillStyle = grad; tg.fillRect(0, 0, S, S);
+  const base = 9;
+  let last = null;
+  for (let i = 0; i <= 400; i++) {
+    const t = i / 400;
+    const x = 18 + t * (W - 36);
+    const y = H / 2 + Math.sin(t * Math.PI * 2) * (H * 0.22);
+    const pr = Math.sin(t * Math.PI);                         // 入り抜き
+    const r = p.pressureSize ? Math.max(0.4, base * (p.min + (1 - p.min) * Math.pow(pr, p.gamma))) : base;
+    if (last && Math.hypot(x - last.x, y - last.y) < Math.max(0.5, r * 2 * p.spacing)) continue;
+    bg.globalAlpha = p.flow * (p.pressureOpacity ? Math.max(0.05, pr) : 1);
+    bg.drawImage(tip, x - r, y - r, r * 2, r * 2);
+    last = { x, y };
+  }
+  if (p.grain > 0) {
+    bg.globalAlpha = 1;
+    bg.globalCompositeOperation = 'destination-out';
+    bg.fillStyle = bg.createPattern(grainTexture(p.grain, p.grainScale), 'repeat');
+    bg.fillRect(0, 0, W, H);
+  }
+  g.clearRect(0, 0, W, H);
+  g.globalAlpha = (p.opacity || 100) / 100;
+  g.drawImage(buf, 0, 0);
 }
 
 // ---- レイヤーパネル ----------------------------------------------------------------

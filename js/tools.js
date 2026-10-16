@@ -28,16 +28,46 @@ function selMode(tool, p) {
 const SEL_MODE_SEG = { key: 'mode', type: 'seg', items: [['replace', '新規'], ['add', '追加'], ['subtract', '削除'], ['intersect', '共通']] };
 
 // ---- ブラシ・消しゴム ------------------------------------------------------------
+/* ペンの種類。min = 筆圧0のときの太さの割合、gamma = 筆圧の効き方（大きいほど入り抜きが細い）、
+   spacing = 点の間隔（太さに対する割合）、flow = 1点の濃さ、grain = 紙の質感（0..1）、grainScale = 質感の粗さ */
+const BRUSH_PRESETS = {
+  round:      { label: '標準ペン',   hardness: 85, min: 0.15, gamma: 1.0, spacing: 0.10, flow: 1.0,  pressureSize: true,  pressureOpacity: false, grain: 0,    grainScale: 1 },
+  gpen:       { label: 'Gペン',      hardness: 96, min: 0.03, gamma: 1.5, spacing: 0.06, flow: 1.0,  pressureSize: true,  pressureOpacity: false, grain: 0,    grainScale: 1 },
+  mapping:    { label: '丸ペン',      hardness: 92, min: 0.35, gamma: 0.8, spacing: 0.06, flow: 1.0,  pressureSize: true,  pressureOpacity: false, grain: 0,    grainScale: 1 },
+  pencil:     { label: '鉛筆',       hardness: 65, min: 0.45, gamma: 1.0, spacing: 0.10, flow: 0.85, pressureSize: true,  pressureOpacity: true,  grain: 0.6,  grainScale: 1 },
+  chalk:      { label: 'チョーク',   hardness: 55, min: 0.60, gamma: 1.0, spacing: 0.12, flow: 0.9,  pressureSize: true,  pressureOpacity: true,  grain: 0.85, grainScale: 2.5 },
+  marker:     { label: 'マーカー',   hardness: 80, min: 1.00, gamma: 1.0, spacing: 0.08, flow: 1.0,  pressureSize: false, pressureOpacity: false, grain: 0,    grainScale: 1, opacity: 60 },
+  airbrush:   { label: 'エアブラシ', hardness: 0,  min: 1.00, gamma: 1.0, spacing: 0.06, flow: 0.12, pressureSize: false, pressureOpacity: true,  grain: 0,    grainScale: 1 },
+  watercolor: { label: '水彩',       hardness: 20, min: 0.50, gamma: 1.0, spacing: 0.08, flow: 0.3,  pressureSize: true,  pressureOpacity: true,  grain: 0.25, grainScale: 3 },
+};
+const ERASER_PRESETS = ['round', 'airbrush', 'pencil', 'chalk'];
+
 class BrushTool extends Tool {
   constructor(app, eraser = false) {
     super(app, eraser ? 'eraser' : 'brush', eraser ? '消しゴム' : 'ブラシ',
-      { size: eraser ? 40 : 12, opacity: 100, hardness: eraser ? 80 : 70, pressureSize: true, pressureOpacity: false, smoothing: 2 });
+      { kind: 'round', size: eraser ? 40 : 12, opacity: 100, hardness: eraser ? 80 : 85, pressureSize: true, pressureOpacity: false, smoothing: 2 });
     this.eraser = eraser;
     this.showsHover = true;
     this.active = false;
+    if (!BRUSH_PRESETS[this.opts.kind]) this.opts.kind = 'round';
+  }
+  get preset() { return BRUSH_PRESETS[this.opts.kind] || BRUSH_PRESETS.round; }
+  presetKeys() { return this.eraser ? ERASER_PRESETS : Object.keys(BRUSH_PRESETS); }
+  /** ペンの種類を選ぶ（硬さ・筆圧の設定もその種類の標準に） */
+  setPreset(kind) {
+    const p = BRUSH_PRESETS[kind];
+    if (!p) return;
+    this.opts.kind = kind;
+    this.opts.hardness = p.hardness;
+    this.opts.pressureSize = p.pressureSize;
+    this.opts.pressureOpacity = p.pressureOpacity;
+    if (p.opacity && !this.eraser) this.opts.opacity = p.opacity;
+    else if (this.opts.opacity === 60 && kind !== 'marker') this.opts.opacity = 100;
+    this.setOpt('kind', kind);
   }
   spec() {
     return [
+      { type: 'preset' },
       { key: 'size', label: 'サイズ', type: 'range', min: 1, max: 500, curve: 2, unit: 'px' },
       { key: 'opacity', label: '不透明度', type: 'range', min: 1, max: 100, unit: '%' },
       { key: 'hardness', label: '硬さ', type: 'range', min: 0, max: 100, unit: '%' },
@@ -114,7 +144,9 @@ class BrushTool extends Tool {
   }
   radius(pressure) {
     const base = this.opts.size / 2;
-    return this.opts.pressureSize ? Math.max(0.5, base * (0.15 + 0.85 * pressure)) : base;
+    if (!this.opts.pressureSize) return base;
+    const p = this.preset;
+    return Math.max(0.5, base * (p.min + (1 - p.min) * Math.pow(clamp(pressure, 0, 1), p.gamma)));
   }
   lineTo(x, y, pressure) {
     const l = this.last;
@@ -122,7 +154,7 @@ class BrushTool extends Tool {
     const dist = Math.hypot(dx, dy);
     if (dist < 1e-3) return;
     const r = this.radius((l.pressure + pressure) / 2);
-    const step = Math.max(0.5, r * 2 * 0.12);
+    const step = Math.max(0.5, r * 2 * this.preset.spacing);
     let t = step - this.carry;
     while (t <= dist) {
       const f = t / dist;
@@ -135,7 +167,7 @@ class BrushTool extends Tool {
   dab(x, y, pressure) {
     const r = this.radius(pressure);
     const g = this.bg;
-    g.globalAlpha = this.opts.pressureOpacity ? clamp(pressure, 0.05, 1) : 1;
+    g.globalAlpha = this.preset.flow * (this.opts.pressureOpacity ? clamp(pressure, 0.05, 1) : 1);
     g.drawImage(this.tip(), x - r, y - r, r * 2, r * 2);
     g.globalAlpha = 1;
     const rect = Rect.clampTo({ x: x - r, y: y - r, w: r * 2, h: r * 2 }, this.doc.width, this.doc.height, 1);
@@ -162,21 +194,33 @@ class BrushTool extends Tool {
   }
   applyTo(g, r) {
     const m = this.mode();
-    g.save();
-    g.globalAlpha = this.opts.opacity / 100;
-    g.globalCompositeOperation = m.gco;
-    if (m.color) {          // 透明部分ロック中の消しゴム = 背景色で塗る
+    const grain = this.preset.grain;
+    let src = this.buf;
+    if (m.color || grain > 0) {
+      // 紙の質感（紙に固定した模様で筆跡を削る）・透明部分ロック中の消しゴム（背景色で塗る）は作業用 canvas で作る
       const tmp = this.app.scratch('tint');
       const tg = ctx2d(tmp);
       tg.save();
+      tg.beginPath(); tg.rect(r.x, r.y, r.w, r.h); tg.clip();
       tg.clearRect(r.x, r.y, r.w, r.h);
       tg.drawImage(this.buf, r.x, r.y, r.w, r.h, r.x, r.y, r.w, r.h);
-      tg.globalCompositeOperation = 'source-in';
-      tg.fillStyle = m.color;
-      tg.fillRect(r.x, r.y, r.w, r.h);
+      if (grain > 0) {
+        tg.globalCompositeOperation = 'destination-out';
+        tg.fillStyle = tg.createPattern(grainTexture(grain, this.preset.grainScale), 'repeat');
+        tg.fillRect(r.x, r.y, r.w, r.h);
+      }
+      if (m.color) {
+        tg.globalCompositeOperation = 'source-in';
+        tg.fillStyle = m.color;
+        tg.fillRect(r.x, r.y, r.w, r.h);
+      }
       tg.restore();
-      g.drawImage(tmp, r.x, r.y, r.w, r.h, r.x, r.y, r.w, r.h);
-    } else g.drawImage(this.buf, r.x, r.y, r.w, r.h, r.x, r.y, r.w, r.h);
+      src = tmp;
+    }
+    g.save();
+    g.globalAlpha = this.opts.opacity / 100;
+    g.globalCompositeOperation = m.gco;
+    g.drawImage(src, r.x, r.y, r.w, r.h, r.x, r.y, r.w, r.h);
     g.restore();
   }
   updateLive(r) {
@@ -204,6 +248,43 @@ class BrushTool extends Tool {
     g.strokeStyle = 'rgba(255,255,255,.85)';
     g.beginPath(); g.arc(s.x, s.y, Math.max(0.5, r - 0.5), 0, Math.PI * 2); g.stroke();
   }
+}
+
+/** 紙の質感の模様（つなぎ目の無い 256px のノイズ。アルファ = 削る強さ） */
+const _grainCache = {};
+function grainTexture(strength, scale) {
+  const key = strength + '|' + scale;
+  if (_grainCache[key]) return _grainCache[key];
+  const S = 256;
+  const val = new Float32Array(S * S);
+  let seed = 12345;
+  const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+  let amp = 1, total = 0;
+  for (const cell of [Math.max(1, Math.round(2 * scale)), Math.max(2, Math.round(5 * scale)), Math.max(4, Math.round(16 * scale))]) {
+    const n = Math.ceil(S / cell);
+    const grid = Float32Array.from({ length: n * n }, rnd);
+    const at = (gx, gy) => grid[((gy % n) + n) % n * n + ((gx % n) + n) % n];
+    for (let y = 0; y < S; y++) {
+      const gy = y / cell, y0 = Math.floor(gy), fy = gy - y0, sy = fy * fy * (3 - 2 * fy);
+      for (let x = 0; x < S; x++) {
+        const gx = x / cell, x0 = Math.floor(gx), fx = gx - x0, sx = fx * fx * (3 - 2 * fx);
+        const top = at(x0, y0) * (1 - sx) + at(x0 + 1, y0) * sx;
+        const bot = at(x0, y0 + 1) * (1 - sx) + at(x0 + 1, y0 + 1) * sx;
+        val[y * S + x] += amp * (top * (1 - sy) + bot * sy);
+      }
+    }
+    total += amp;
+    amp *= 0.55;
+  }
+  const c = newCanvas(S, S), g = ctx2d(c);
+  const img = g.createImageData(S, S);
+  for (let i = 0; i < S * S; i++) {
+    const v = val[i] / total;                       // 0..1、平均 0.5
+    img.data[i * 4 + 3] = Math.round(clamp((v - 0.35) * 2.2, 0, 1) * strength * 255);
+  }
+  g.putImageData(img, 0, 0);
+  _grainCache[key] = c;
+  return c;
 }
 
 // ---- スポイト --------------------------------------------------------------------
@@ -590,14 +671,16 @@ const TOOL_ICONS = {
   fill: '<path d="M5 11 12 4l7 7-7 7z"/><path d="M5 11h14M20 16c0 1.5 1 2.5 1 3.5a1 1 0 0 1-2 0c0-1 1-2 1-3.5z"/>',
   gradient: '<rect x="4" y="5" width="16" height="14" rx="1"/><path d="M8 5v14M12 5v14M16 5v14" stroke-opacity=".5"/>',
   eyedropper: '<path d="M4 20l1-4 8-8 3 3-8 8z"/><path d="M13 8l2-2a2.1 2.1 0 0 1 3 3l-2 2"/>',
+  transform: '<rect x="5" y="5" width="14" height="14" stroke-dasharray="2 2"/><path d="M3 3h4v4H3zM17 3h4v4h-4zM17 17h4v4h-4zM3 17h4v4H3z"/>',
+  crop: '<path d="M6 2v16h16M2 6h16v16"/>',
   hand: '<path d="M8 13V6a1.5 1.5 0 0 1 3 0v6M11 11V4.5a1.5 1.5 0 0 1 3 0V11M14 11V6a1.5 1.5 0 0 1 3 0v8c0 4-2.5 6-6 6s-5-2-6.5-4.5L4 13a1.5 1.5 0 0 1 2.5-1.5L8 13"/>',
   zoom: '<circle cx="10.5" cy="10.5" r="6"/><path d="M15 15l5 5M8 10.5h5M10.5 8v5"/>',
 };
-const TOOL_KEYS = { move: 'V', marquee_rect: 'M', lasso: 'L', wand: 'W', brush: 'B', eraser: 'E', fill: 'G', gradient: 'G', eyedropper: 'I', hand: 'H', zoom: 'Z' };
+const TOOL_KEYS = { transform: '⌘T', crop: 'C', move: 'V', marquee_rect: 'M', lasso: 'L', wand: 'W', brush: 'B', eraser: 'E', fill: 'G', gradient: 'G', eyedropper: 'I', hand: 'H', zoom: 'Z' };
 
 function makeTools(app) {
   const list = [
-    new MoveTool(app), new MarqueeTool(app, false), new MarqueeTool(app, true), new LassoTool(app), new WandTool(app),
+    new MoveTool(app), new TransformTool(app), new CropTool(app), new MarqueeTool(app, false), new MarqueeTool(app, true), new LassoTool(app), new WandTool(app),
     null,
     new BrushTool(app, false), new BrushTool(app, true), new FillTool(app), new GradientTool(app), new EyedropperTool(app),
     null,

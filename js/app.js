@@ -1,7 +1,7 @@
 'use strict';
 /* アプリ本体: 画面の切り替え・コマンド・メニュー・キーボード・自動保存 */
 
-const APP_VERSION = '0.1.0';
+const APP_VERSION = '0.2.0';
 
 class App {
   constructor() {
@@ -17,6 +17,9 @@ class App {
     this.view = new View(this, $('#view'));
     this.layersPanel = new LayersPanel(this);
     this.colorPanel = new ColorPanel(this);
+    this.adjust = new AdjustPanel(this);
+    this.lastFilter = null;
+    this.prevTool = null;
     this._scratch = {};
     this.clip = null;
     this.autosave = debounce(() => this.saveNow(), 1800);
@@ -71,13 +74,27 @@ class App {
 
   // ---- ツール
   selectTool(name) {
-    if (!this.tools[name]) return;
-    if (this.view.mode === 'tool') return;
+    const next = this.tools[name];
+    if (!next || this.view.mode === 'tool') return;
+    const cur = this.tool;
+    if (cur === next) { if (next.activate && !next.state && !next.rect && this.doc) next.activate(); updateToolbar(this); buildOptbar(this); return; }
+    if (cur && cur.deactivate) cur.deactivate();
+    if (next.activate && this.doc) {
+      if (this.adjust.open) this.adjust.cancel();
+      if (next.activate() === false) { updateToolbar(this); return; }
+    }
+    if (cur && !cur.activate) this.prevTool = cur.name;
     this.toolName = name;
-    LS.set('tool', name);
+    if (!next.activate) LS.set('tool', name);
     updateToolbar(this);
     buildOptbar(this);
     this.view.request();
+  }
+  /** 変形中・補正パネル表示中なら、ほかの操作の前に確定（変形）・取り消し（補正）する */
+  settle({ commit = true } = {}) {
+    if (this.adjust.open) this.adjust.cancel();
+    const t = this.tool;
+    if (t && t.state) { if (commit) t.commit(); else t.cancelAll(); }
   }
   cannotEdit(tool) {
     const d = this.doc;
@@ -131,6 +148,8 @@ class App {
     $('#docTitle').textContent = doc.name;
     this.layersPanel.thumbs.clear();
     this.layersPanel.render();
+    updateToolbar(this);
+    buildOptbar(this);
     this.updateUndo();
     renderHistory(this);
     this.view._needFit = true;
@@ -140,6 +159,8 @@ class App {
     if (!doc.workId) this.saveNow();
   }
   async closeDoc() {
+    this.settle({ commit: false });
+    if (this.tool && this.tool.deactivate) { this.tool.deactivate(); this.toolName = this.prevTool || 'brush'; }
     this.autosave.cancel();
     await this.saveNow();
     this.doc = null;
@@ -182,11 +203,14 @@ class App {
   }
   undo() {
     if (!this.doc || this.view.mode === 'tool') return;
+    if (this.adjust.open) { this.adjust.cancel(); return; }
+    if (this.tool && this.tool.state) { this.tool.cancelAll(); this.hint('変形を取り消しました'); return; }
     const l = this.doc.history.undo();
     if (l) this.hint('取り消し: ' + l);
   }
   redo() {
     if (!this.doc || this.view.mode === 'tool') return;
+    if (this.adjust.open || (this.tool && this.tool.state)) return;
     const l = this.doc.history.redo();
     if (l) this.hint('やり直し: ' + l);
   }
@@ -540,6 +564,9 @@ class App {
       'edit.clear': () => this.clearSelection(),
       'edit.fillFg': () => this.fillSelection(this.fg, '塗りつぶし（描画色）'),
       'edit.fillBg': () => this.fillSelection(this.bg, '塗りつぶし（背景色）'),
+      'edit.transform': () => this.selectTool('transform'),
+      'image.cropTool': () => this.selectTool('crop'),
+      'filter.last': () => { if (this.lastFilter) this.adjust.applyNow(findSpec(this.lastFilter.key), this.lastFilter.params); else toast('まだフィルターを使っていません'); },
       'image.size': () => this.imageSizeDialog(),
       'image.canvas': () => this.canvasSizeDialog(),
       'image.rot90': () => d.rotate(90),
@@ -581,9 +608,11 @@ class App {
       'view.zoomOut': () => this.view.zoomStep(-1),
       'view.side': () => this.showSide($('#editor').classList.contains('side-hidden')),
     };
-    const fn = C[name];
+    let fn = C[name];
+    if (!fn && name.startsWith('adj.')) fn = () => this.adjust.start(name.slice(4));
     if (!fn) { console.warn('unknown command', name); return; }
     if (!d && !name.startsWith('file.new') && name !== 'file.photo') return;
+    if (!name.startsWith('view.') && name !== 'edit.undo' && name !== 'edit.redo') this.settle();
     try {
       const r = fn();
       if (r && r.catch) r.catch((e) => { console.error(e); toast('エラー: ' + e.message, { error: true }); });
@@ -610,15 +639,36 @@ class App {
         it('やり直し', 'edit.redo', '⇧' + M + 'Z', { disabled: !d.history.canRedo }), '-',
         it('切り取り', 'edit.cut', M + 'X'), it('コピー', 'edit.copy', M + 'C'), it('結合部分をコピー', 'edit.copyMerged', '⇧' + M + 'C'),
         it('ペースト', 'edit.paste', M + 'V', { disabled: !this.clip }), it('消去', 'edit.clear', 'Delete'), '-',
-        it('描画色で塗りつぶし', 'edit.fillFg', '⌥⌫'), it('背景色で塗りつぶし', 'edit.fillBg', M + '⌫'),
+        it('描画色で塗りつぶし', 'edit.fillFg', '⌥⌫'), it('背景色で塗りつぶし', 'edit.fillBg', M + '⌫'), '-',
+        it('自由変形', 'edit.transform', M + 'T'),
       ];
       case 'image': return [
         it('画像解像度（拡大・縮小）…', 'image.size'), it('カンバスサイズ…', 'image.canvas'), '-',
         it('90° 回転（時計回り）', 'image.rot90'), it('90° 回転（反時計回り）', 'image.rot270'), it('180° 回転', 'image.rot180'),
         it('左右反転', 'image.flipH'), it('上下反転', 'image.flipV'), '-',
-        it('選択範囲で切り抜き', 'image.crop', '', { disabled: !hasSel }), it('透明部分を切り抜き', 'image.trim'), '-',
+        it('切り抜きツール', 'image.cropTool', 'C'), it('選択範囲で切り抜き', 'image.crop', '', { disabled: !hasSel }), it('透明部分を切り抜き', 'image.trim'), '-',
         it('画像を統合', 'image.flatten'),
       ];
+      case 'adjust': {
+        const keys = { levels: M + 'L', curves: M + 'M', hue_saturation: M + 'U', color_balance: M + 'B', invert: M + 'I', desaturate: '⇧' + M + 'U', auto_tone: '⇧' + M + 'L' };
+        const order = [['brightness_contrast', 'levels', 'curves', 'exposure'], ['vibrance', 'hue_saturation', 'color_balance', 'color_temperature', 'black_white', 'photo_filter'],
+          ['invert', 'desaturate', 'posterize', 'threshold'], ['auto_tone', 'auto_contrast']];
+        const out = [];
+        order.forEach((grp, i) => {
+          if (i) out.push('-');
+          for (const k of grp) out.push(it(ADJUSTMENTS[k].label + (ADJUSTMENTS[k].noDialog ? '' : '…'), 'adj.' + k, keys[k] || ''));
+        });
+        return out;
+      }
+      case 'filter': {
+        const out = [it('前回のフィルター' + (this.lastFilter ? `（${findSpec(this.lastFilter.key).label}）` : ''), 'filter.last', '⌥' + M + 'F', { disabled: !this.lastFilter })];
+        let group = null;
+        for (const s of Object.values(FILTERS)) {
+          if (s.group !== group) { out.push('-'); out.push({ head: s.group }); group = s.group; }
+          out.push(it(s.label + (s.noDialog ? '' : '…'), 'adj.' + s.key));
+        }
+        return out;
+      }
       case 'layer': return [
         it('新規レイヤー', 'layer.new', '⇧' + M + 'N'), it('レイヤーを複製', 'layer.duplicate'), it('レイヤーを削除', 'layer.delete'),
         it('名前を変更…', 'layer.rename'), '-',
@@ -701,6 +751,13 @@ class App {
       if (k === ' ') { if (!this.view.spaceDown) { this.view.spaceDown = true; this.view.canvas.style.cursor = 'grab'; } e.preventDefault(); return; }
       if (mod) {
         if (k === 'z') return run(e.shiftKey ? 'edit.redo' : 'edit.undo');
+        if (k === 't') return run('edit.transform');
+        if (k === 'l') return run(e.shiftKey ? 'adj.auto_tone' : 'adj.levels');
+        if (k === 'm') return run('adj.curves');
+        if (k === 'u') return run(e.shiftKey ? 'adj.desaturate' : 'adj.hue_saturation');
+        if (k === 'b') return run('adj.color_balance');
+        if (k === 'i' && !e.shiftKey) return run('adj.invert');
+        if (k === 'f' && e.altKey) return run('filter.last');
         if (k === 'y') return run('edit.redo');
         if (k === 'a') return run('select.all');
         if (k === 'd') return run('select.none');
@@ -727,7 +784,18 @@ class App {
       if (k === ']') { e.preventDefault(); this.brushSize(1); return; }
       if (k === 'x') { this.swapColors(); return; }
       if (k === 'd') { this.resetColors(); return; }
-      if (k === 'Escape') { if (this.view.mode === 'tool') this.view.cancelTool(); return; }
+      if (k === 'Escape') {
+        if (this.view.mode === 'tool') this.view.cancelTool();
+        else if (this.adjust.open) this.adjust.cancel();
+        else if (this.tool.state) this.tool.cancelAll();
+        return;
+      }
+      if (k === 'Enter') {
+        if (this.adjust.open) { e.preventDefault(); this.adjust.ok(); return; }
+        if (this.tool.state) { e.preventDefault(); this.tool.commit(); return; }
+        if (this.toolName === 'crop') { e.preventDefault(); this.tool.commit(); return; }
+        return;
+      }
       if (k.startsWith('Arrow') && this.toolName === 'move') {
         e.preventDefault();
         const s = e.shiftKey ? 10 : 1;
@@ -736,7 +804,7 @@ class App {
         this.tools.move.nudge(dx, dy);
         return;
       }
-      const map = { v: 'move', m: 'marquee_rect', l: 'lasso', w: 'wand', b: 'brush', e: 'eraser', g: 'fill', i: 'eyedropper', h: 'hand', z: 'zoom' };
+      const map = { c: 'crop', v: 'move', m: 'marquee_rect', l: 'lasso', w: 'wand', b: 'brush', e: 'eraser', g: 'fill', i: 'eyedropper', h: 'hand', z: 'zoom' };
       if (map[k]) {
         if (k === 'm' && this.toolName === 'marquee_rect') return this.selectTool('marquee_ellipse');
         if (k === 'g' && this.toolName === 'fill') return this.selectTool('gradient');
