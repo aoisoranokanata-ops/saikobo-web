@@ -82,26 +82,32 @@ const Store = {
     };
     const files = {};
     let bytes = 0;
+    const packCached = async (key, canvas, ver, toPng) => {
+      let c = this.blobCache.get(key);
+      if (!c || c.canvas !== canvas || c.ver !== ver) {
+        c = { canvas, ver, packed: await packBlob(await canvasToBlob(toPng ? toPng(canvas) : canvas)) };
+        this.blobCache.set(key, c);
+      }
+      bytes += c.packed.buf.byteLength;
+      return c.packed;
+    };
     for (let i = 0; i < doc.layers.length; i++) {
       const l = doc.layers[i];
-      const path = `layers/${String(i).padStart(4, '0')}.png`;
+      const num = String(i).padStart(4, '0');
       const entry = { ...l.extra };
       for (const k of LAYER_PROPS) entry[k] = l[k];
       entry.id = l.id;
-      entry.file = path;
+      entry.file = l.canvas ? `layers/${num}.png` : null;          // グループ・調整レイヤーは画素なし（exe と同じ）
+      if (entry.file) files[entry.file] = await packCached(l.id, l.canvas, l.ver);
+      if (l.mask) {                                                // マスクは exe と同じ灰色の PNG（白 = 見える）
+        entry.mask_file = `masks/${num}.png`;
+        files[entry.mask_file] = await packCached(l.id + ':m', l.mask, l.ver, maskToGray);
+      }
       meta.layers.push(entry);
       if (l.id === doc.activeId) meta.active = i;
-      let c = this.blobCache.get(l.id);
-      if (!c || c.canvas !== l.canvas || c.ver !== l.ver) {
-        const ver = l.ver, canvas = l.canvas;
-        c = { canvas, ver, packed: await packBlob(await canvasToBlob(canvas)) };
-        this.blobCache.set(l.id, c);
-      }
-      files[path] = c.packed;
-      bytes += c.packed.buf.byteLength;
     }
     if (doc.sel) {
-      files['selection.png'] = await packBlob(await canvasToBlob(doc.sel.canvas));
+      files['selection.png'] = await packBlob(await canvasToBlob(maskToGray(doc.sel.canvas)));
       meta.selection = 'selection.png';
     }
     const thumb = await packBlob(await this.makeThumb(doc));
@@ -172,41 +178,61 @@ async function docFromMeta(meta, files, { name } = {}) {
   const idMap = new Map();
   for (let i = 0; i < meta.layers.length; i++) {
     const e = meta.layers[i];
-    const l = new Layer(W, H, e.name || `レイヤー ${i + 1}`);
-    if (e.file && files[e.file]) {
+    const kind = e.group ? 'group' : e.adjustment ? 'adjustment' : 'pixel';
+    const l = new Layer(W, H, e.name || `レイヤー ${i + 1}`, null, { kind });
+    if (kind === 'pixel' && e.file && files[e.file]) {
       const img = await blobToImage(files[e.file]);
       l.ctx.drawImage(img, 0, 0);
       if (img.close) img.close();
     }
     for (const k of LAYER_PROPS) if (k in e) l[k] = e[k];
+    if (l.text) l.text = { ...TEXT_DEFAULTS, ...l.text };
+    if (e.mask_file && files[e.mask_file]) l.mask = await maskFromImage(files[e.mask_file], W, H);
     const extra = {};
     for (const [k, v] of Object.entries(e)) {
-      if (!LAYER_PROPS.includes(k) && k !== 'id' && k !== 'file' && v != null && v !== false) extra[k] = v;
+      if (!LAYER_PROPS.includes(k) && !['id', 'file', 'mask_file'].includes(k) && v != null && v !== false) extra[k] = v;
     }
-    delete extra.mask_enabled;        // 既定値（true）は持たなくてよい
-    if (e.mask_enabled === false) extra.mask_enabled = false;
     l.extra = extra;
     idMap.set(e.id, l.id);
     maxId = Math.max(maxId, l.id);
     doc.layers.push(l);
     if (meta.active === i) doc.activeId = l.id;
   }
-  for (const l of doc.layers) if (l.extra.parent != null) l.extra = { ...l.extra, parent: idMap.get(l.extra.parent) ?? null };
+  for (const l of doc.layers) if (l.parent != null) l.parent = idMap.get(l.parent) ?? null;   // 保存時の id → 読み込んだ id
   if (!doc.layers.length) {
     const l = new Layer(W, H, '背景');
     doc.layers.push(l);
   }
   if (doc.activeId == null) doc.activeId = doc.layers[doc.layers.length - 1].id;
-  if (meta.selection && files[meta.selection]) {
-    const c = newCanvas(W, H);
-    const img = await blobToImage(files[meta.selection]);
-    ctx2d(c).drawImage(img, 0, 0);
-    doc.sel = Sel.fromCanvas(c);
-  }
+  if (meta.selection && files[meta.selection]) doc.sel = Sel.fromCanvas(await maskFromImage(files[meta.selection], W, H));
   bumpLayerId(maxId);
   doc.compDirty = doc.fullRect;
   doc.history.clear('開く');
   return doc;
+}
+
+/** マスク・選択範囲（白・アルファ）→ exe と同じ灰色の画像（白 = 見える） */
+function maskToGray(m) {
+  const c = newCanvas(m.width, m.height), g = ctx2d(c);
+  g.fillStyle = '#000'; g.fillRect(0, 0, c.width, c.height);
+  g.drawImage(m, 0, 0);
+  return c;
+}
+/** 灰色の画像（exe の L）も、白・アルファの画像（古い Web 版）も、マスク（白・アルファ）にする */
+async function maskFromImage(blob, W, H) {
+  const img = await blobToImage(blob);
+  const c = newCanvas(W, H), g = ctx2d(c);
+  g.drawImage(img, 0, 0);
+  if (img.close) img.close();
+  const data = g.getImageData(0, 0, W, H);
+  const d = data.data;
+  for (let i = 0; i < d.length; i += 4) {
+    const v = Math.min(d[i + 3], d[i]);
+    d[i] = d[i + 1] = d[i + 2] = 255;
+    d[i + 3] = v;
+  }
+  g.putImageData(data, 0, 0);
+  return c;
 }
 
 /** 画像ファイル → 文書（大きすぎれば縮める） */

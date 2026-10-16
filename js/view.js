@@ -207,6 +207,7 @@ class View {
     const tool = this.app.tool;
     if (!tool) return;
     if (this.app.adjust && this.app.adjust.open) { toast('補正パネルを閉じてから描いてください（OK かキャンセル）'); return; }
+    if (this.app.layerUI && this.app.layerUI.open && this.app.toolName !== 'text') { toast('パネルを閉じてから描いてください（OK かキャンセル）'); return; }
     const why = this.app.cannotEdit(tool);
     if (why) { toast(why, { error: true }); return; }
     this.mode = 'tool';

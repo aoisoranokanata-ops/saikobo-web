@@ -116,6 +116,13 @@ function drawHandles(g, view, q, { center = true } = {}) {
 // ---- 自由変形 --------------------------------------------------------------------
 class TransformTool extends Tool {
   constructor(app) { super(app, 'transform', '自由変形', { mode: 'scale', keep: true }); this.state = null; }
+  needsLayer() { return 'move'; }
+  optChanged(key) {
+    if (key === 'mode' && this.state && this.state.text && this.opts.mode === 'distort') {
+      this.setOpt('mode', 'scale');
+      toast('テキストは「拡大・回転」だけです（遠近にするときはラスタライズしてから）');
+    }
+  }
   spec() {
     const info = this.state ? this.infoText() : '';
     return [
@@ -140,22 +147,31 @@ class TransformTool extends Tool {
     if (why) { toast(why, { error: true }); return false; }
     const layer = d.active;
     const W = d.width, H = d.height;
-    const float = cloneCanvas(layer.canvas), base = newCanvas(W, H);
+    // 何を変形するか: マスク編集中ならマスクだけ。テキストは全体（行列を変える）。それ以外は画素（選択範囲があればその中）
+    const attr = d.editingMask && layer.mask ? 'mask' : 'canvas';
+    const text = attr === 'canvas' && layer.isText;
+    const sel = text ? null : d.sel;
+    if (text && this.opts.mode === 'distort') this.setOpt('mode', 'scale');
+    const float = cloneCanvas(layer[attr]), base = newCanvas(W, H);
     let selSrc = null;
-    if (d.sel) {
-      const fg = ctx2d(float); fg.globalCompositeOperation = 'destination-in'; fg.drawImage(d.sel.canvas, 0, 0);
-      const bg = ctx2d(base); bg.drawImage(layer.canvas, 0, 0); bg.globalCompositeOperation = 'destination-out'; bg.drawImage(d.sel.canvas, 0, 0);
+    if (sel) {
+      const fg = ctx2d(float); fg.globalCompositeOperation = 'destination-in'; fg.drawImage(sel.canvas, 0, 0);
+      const bg = ctx2d(base); bg.drawImage(layer[attr], 0, 0); bg.globalCompositeOperation = 'destination-out'; bg.drawImage(sel.canvas, 0, 0);
     }
     const b = alphaBounds(float);
-    if (!b) { toast(d.sel ? '選択範囲の中に何も描かれていません' : 'このレイヤーは空です'); return false; }
+    if (!b) { toast(sel ? '選択範囲の中に何も描かれていません' : attr === 'mask' ? 'マスクが空です' : 'このレイヤーは空です'); return false; }
     const src = newCanvas(b.w, b.h);
     ctx2d(src).drawImage(float, -b.x, -b.y);
-    if (d.sel) { selSrc = newCanvas(b.w, b.h); ctx2d(selSrc).drawImage(d.sel.canvas, -b.x, -b.y); }
+    if (sel) { selSrc = newCanvas(b.w, b.h); ctx2d(selSrc).drawImage(sel.canvas, -b.x, -b.y); }
     const quad = [{ x: b.x, y: b.y }, { x: b.x + b.w, y: b.y }, { x: b.x + b.w, y: b.y + b.h }, { x: b.x, y: b.y + b.h }];
-    this.state = { layer, base, src, selSrc, bounds: b, quad, start: quadCopy(quad) };
+    // 画素と一緒にマスクも動かす（選択範囲が無く、マスク編集中でないとき）
+    const withMask = attr === 'canvas' && !!layer.mask && !sel;
+    this.state = { layer, attr, text, withMask, base, src, selSrc, bounds: b, quad, start: quadCopy(quad) };
     this.hideAnts = true;
     this.liveC = this.app.scratch('live');
-    d.live = { layer, canvas: this.liveC, update: (r) => this.renderLive(r) };
+    d.live = { layer, update: (r) => this.renderLive(r) };
+    d.live[attr] = this.liveC;
+    if (withMask) { this.liveM = this.app.scratch('liveMask'); d.live.mask = this.liveM; }
     d.invalidate(null, 'live');
     return true;
   }
@@ -167,6 +183,35 @@ class TransformTool extends Tool {
     g.clearRect(r.x, r.y, r.w, r.h);
     g.drawImage(s.base, 0, 0);
     drawQuad(g, s.src, s.quad, 8);
+    g.restore();
+    if (s.withMask) {
+      const m = ctx2d(this.liveM);
+      m.save(); m.beginPath(); m.rect(r.x, r.y, r.w, r.h); m.clip();
+      this.drawMaskTransformed(m, s, 8);
+      m.restore();
+    }
+  }
+  /** 変形前の範囲 → 変形後の四角形 を、マスク全体にかける（空いた所は「見える」） */
+  drawMaskTransformed(g, s, n) {
+    const d = this.doc, b = s.bounds;
+    g.save();
+    g.globalCompositeOperation = 'source-over';
+    g.fillStyle = '#fff'; g.fillRect(0, 0, d.width, d.height);
+    if (isParallelogram(s.quad)) {
+      const M = affine3({ x: b.x, y: b.y }, { x: b.x + b.w, y: b.y }, { x: b.x, y: b.y + b.h }, s.quad[0], s.quad[1], s.quad[3]);
+      const corners = [[0, 0], [d.width, 0], [d.width, d.height], [0, d.height]].map(([x, y]) => matApply(M, x, y));
+      g.beginPath(); corners.forEach((p, i) => (i ? g.lineTo(p.x, p.y) : g.moveTo(p.x, p.y))); g.closePath();
+      g.save(); g.clip(); g.clearRect(0, 0, d.width, d.height); g.restore();
+      g.setTransform(...M);
+      g.drawImage(s.layer.mask, 0, 0);
+    } else {
+      const part = newCanvas(b.w, b.h);
+      ctx2d(part).drawImage(s.layer.mask, -b.x, -b.y);
+      g.globalCompositeOperation = 'destination-out';
+      g.beginPath(); s.quad.forEach((p, i) => (i ? g.lineTo(p.x, p.y) : g.moveTo(p.x, p.y))); g.closePath(); g.fill();
+      g.globalCompositeOperation = 'source-over';
+      drawQuad(g, part, s.quad, n);
+    }
     g.restore();
   }
   changed() {
@@ -252,14 +297,26 @@ class TransformTool extends Tool {
   commit({ keepTool = false } = {}) {
     const s = this.state, d = this.doc;
     if (!s) return;
-    this.state = null; this.drag = null; this.hideAnts = false;
+    this.state = null; this.drag = null; this.hideAnts = false; this.liveM = null;
     d.live = null;
     const same = s.quad.every((p, i) => Math.abs(p.x - s.start[i].x) < 1e-6 && Math.abs(p.y - s.start[i].y) < 1e-6);
     if (!same) {
-      d.change('自由変形', () => {
-        const c = cloneCanvas(s.base);
-        drawQuad(ctx2d(c), s.src, s.quad, 24);
-        s.layer.canvas = c;
+      d.change(s.attr === 'mask' ? '自由変形（マスク）' : '自由変形', () => {
+        const b = s.bounds;
+        if (s.text) {            // テキスト: 行列を変えて描き直す（ぼやけない・あとで文字を直せる）
+          const M = affine3({ x: b.x, y: b.y }, { x: b.x + b.w, y: b.y }, { x: b.x, y: b.y + b.h }, s.quad[0], s.quad[1], s.quad[3]);
+          s.layer.text = { ...s.layer.text, matrix: matMul(M, s.layer.text.matrix) };
+          s.layer.canvas = renderTextSpec(s.layer.text, d.width, d.height);
+        } else {
+          const c = cloneCanvas(s.base);
+          drawQuad(ctx2d(c), s.src, s.quad, 24);
+          s.layer[s.attr] = c;
+        }
+        if (s.withMask) {
+          const m = newCanvas(d.width, d.height);
+          this.drawMaskTransformed(ctx2d(m), s, 24);
+          s.layer.mask = m;
+        }
         if (s.selSrc) {
           const sc = newCanvas(d.width, d.height);
           drawQuad(ctx2d(sc), s.selSrc, s.quad, 24);
@@ -271,7 +328,7 @@ class TransformTool extends Tool {
   }
   cancelAll() {
     if (!this.state) return;
-    this.state = null; this.drag = null; this.hideAnts = false;
+    this.state = null; this.drag = null; this.hideAnts = false; this.liveM = null;
     this.doc.live = null;
     this.doc.invalidate(null, 'live');
     this.app.selectTool(this.app.prevTool || 'move');

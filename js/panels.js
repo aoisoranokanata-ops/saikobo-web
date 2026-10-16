@@ -159,11 +159,10 @@ class LayersPanel {
     this.blend = $('#lyBlend');
     this.opacity = $('#lyOpacity');
     this.opacityV = $('#lyOpacityV');
-    for (const [k, label, , exact] of BLEND_MODES) this.blend.append(el('option', { value: k }, (exact ? '' : '≈ ') + label));
     this.blend.addEventListener('change', () => {
       const l = this.app.doc.active;
       if (l) this.app.doc.setLayerProps(l, { blend: this.blend.value }, '描画モード');
-      if (!BLEND[this.blend.value].exact) toast('このモードは Web 版では近い式で表示します（exe 版では正確）');
+      if (BLEND[this.blend.value] && !BLEND[this.blend.value].exact) toast('このモードは Web 版では近い式で表示します（exe 版では正確）');
     });
     this.opacity.addEventListener('input', () => {
       const l = this.app.doc.active;
@@ -189,97 +188,177 @@ class LayersPanel {
       const l = this.app.doc.active;
       if (l) this.app.doc.setLayerProps(l, { locked: e.target.checked }, 'すべてロック');
     });
-    this.thumbs = new Map();       // layer.id → {canvas, ref, ver}
+    this.thumbs = new Map();       // key（layer.id か id:m）→ {canvas, ref, ver, w, h}
     this.refreshThumbs = debounce(() => this.updateThumbs(), 250);
+  }
+  /** 折りたたんだグループの中は出さない */
+  hiddenByCollapse(doc, l) {
+    for (let p = doc.parentOf(l); p; p = doc.parentOf(p)) if (p.group && p.group.collapsed) return true;
+    return false;
   }
   render() {
     const doc = this.app.doc;
     if (!doc) return;
     this.list.replaceChildren();
-    const ids = new Set();
+    const keys = new Set();
     for (let i = doc.layers.length - 1; i >= 0; i--) {
       const l = doc.layers[i];
-      ids.add(l.id);
-      const th = this.thumb(l);
+      if (this.hiddenByCollapse(doc, l)) continue;
+      const depth = doc.depth(l);
       const eye = el('button', { class: 'eye' + (l.visible ? '' : ' off'), 'aria-label': '表示', title: '表示・非表示' }, '👁');
       eye.addEventListener('click', (e) => { e.stopPropagation(); doc.setLayerProps(l, { visible: !l.visible }, l.visible ? 'レイヤーを非表示' : 'レイヤーを表示'); });
+      const parts = [eye];
+      if (depth) parts.push(el('span', { class: 'indent', style: `width:${depth * 14}px` }));
+      if (l.isGroup) {
+        const tw = el('button', { class: 'twisty', 'aria-label': '開く・閉じる' }, l.group.collapsed ? '▸' : '▾');
+        tw.addEventListener('click', (e) => {          // 折りたたみは履歴に残さない（exe と同じ）
+          e.stopPropagation();
+          l.group = { ...l.group, collapsed: !l.group.collapsed };
+          doc.emit('layers');
+        });
+        parts.push(tw);
+      }
+      if (l.clip) parts.push(el('span', { class: 'clip-mark', title: 'クリッピングマスク' }, '↳'));
+      const main = this.thumb(l);
+      keys.add(String(l.id));
+      const onMain = doc.activeId === l.id && !doc.editingMask;
+      main.classList.toggle('sel', onMain && !!l.mask);
+      main.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (doc.activeId === l.id && doc.editingMask) { doc.editingMask = false; doc.emit('layers'); return; }
+        if (doc.activeId === l.id) { this.app.cmd(l.isText || l.isAdjustment ? 'layer.edit' : 'layer.rename'); return; }
+        doc.editingMask = false;
+        doc.setActive(l);
+      });
+      parts.push(main);
+      if (l.mask) {
+        const mt = this.maskThumb(l);
+        keys.add(l.id + ':m');
+        mt.classList.toggle('sel', doc.activeId === l.id && doc.editingMask);
+        mt.classList.toggle('off', l.mask_enabled === false);
+        mt.addEventListener('click', (e) => {
+          e.stopPropagation();
+          doc.setActive(l);
+          doc.editingMask = true;
+          doc.emit('layers');
+          this.app.hint('マスクを編集中（黒で隠す・白で見せる）');
+        });
+        parts.push(mt);
+      }
       const sub = [];
-      if (l.blend !== 'normal') sub.push(BLEND[l.blend] ? BLEND[l.blend].label : l.blend);
+      if (l.isGroup) sub.push('グループ');
+      if (l.isAdjustment) sub.push('調整');
+      if (l.isText) sub.push('テキスト');
+      if (l.blend !== 'normal' && !(l.isGroup && l.blend === 'pass_through')) sub.push(BLEND[l.blend] ? BLEND[l.blend].label : l.blend);
       if (l.opacity < 1) sub.push(Math.round(l.opacity * 100) + '%');
+      if (l.hasStyles()) sub.push('fx');
       if (l.locked) sub.push('🔒');
       else if (l.alpha_locked) sub.push('▦ロック');
-      if (Object.keys(l.extra).length) sub.push('exe の属性あり');
-      const li = el('li', { class: 'layer-item' + (l.id === doc.activeId ? ' on' : ''), 'data-id': l.id },
-        eye, th.canvas,
-        el('div', { class: 'lname' }, el('div', {}, l.name), sub.length ? el('div', { class: 'lsub' }, sub.join(' · ')) : null),
-        el('span', { class: 'handle', title: 'ドラッグで並べ替え' }, '≡'));
+      parts.push(el('div', { class: 'lname' }, el('div', {}, l.name), sub.length ? el('div', { class: 'lsub' }, sub.join(' · ')) : null));
+      parts.push(el('span', { class: 'handle', title: 'ドラッグで並べ替え' }, '≡'));
+      const li = el('li', { class: 'layer-item' + (l.id === doc.activeId ? ' on' : '') + (l.isGroup ? ' grp' : ''), 'data-id': l.id }, ...parts);
       li.addEventListener('click', () => {
-        if (l.id === doc.activeId) this.app.cmd('layer.rename');
-        else doc.setActive(l);
+        if (l.id === doc.activeId) this.app.cmd(l.isText || l.isAdjustment ? 'layer.edit' : 'layer.rename');
+        else { doc.editingMask = false; doc.setActive(l); }
       });
       li.addEventListener('contextmenu', (e) => { e.preventDefault(); this.menu(l, li); });
       this.longPress(li, () => this.menu(l, li));
       this.dragHandle(li.querySelector('.handle'), l);
       this.list.append(li);
     }
-    for (const id of [...this.thumbs.keys()]) if (!ids.has(id)) this.thumbs.delete(id);
+    for (const k of [...this.thumbs.keys()]) if (!keys.has(k)) this.thumbs.delete(k);
     this.updateProps();
   }
   updateProps() {
     const l = this.app.doc && this.app.doc.active;
     if (!l) return;
+    // 描画モードの一覧（グループだけ「通過」がある）
+    const want = l.isGroup ? 'group' : 'layer';
+    if (this.blend.dataset.kind !== want) {
+      this.blend.replaceChildren();
+      if (l.isGroup) this.blend.append(el('option', { value: 'pass_through' }, '通過'));
+      for (const [k, label, , exact] of BLEND_MODES) this.blend.append(el('option', { value: k }, (exact ? '' : '≈ ') + label));
+      this.blend.dataset.kind = want;
+    }
     this.blend.value = l.blend in BLEND ? l.blend : 'normal';
     if (this._opBefore == null) {
       this.opacity.value = Math.round(l.opacity * 100);
       this.opacityV.textContent = Math.round(l.opacity * 100) + '%';
     }
     $('#lyAlphaLock').checked = !!l.alpha_locked;
+    $('#lyAlphaLock').disabled = !l.canvas || l.isText;
     $('#lyLock').checked = !!l.locked;
   }
   thumb(l) {
-    let t = this.thumbs.get(l.id);
-    if (!t) {
-      t = { canvas: el('canvas', { class: 'lthumb', width: 96, height: 80 }), ref: null, ver: -1 };
-      this.thumbs.set(l.id, t);
+    const key = String(l.id);
+    if (l.isGroup || l.isAdjustment) {
+      const icon = el('div', { class: 'lthumb icon' }, l.isGroup ? '📁' : '◐');
+      if (l.isAdjustment) icon.title = (ADJUSTMENTS[l.adjustment.key] || {}).label || '調整レイヤー';
+      return icon;
     }
-    this.drawThumb(l, t);
-    return t;
+    let t = this.thumbs.get(key);
+    if (!t) { t = { canvas: el('canvas', { class: 'lthumb', width: 96, height: 80 }), ref: null, ver: -1 }; this.thumbs.set(key, t); }
+    this.drawThumb(l.canvas, l.ver, t, false);
+    const wrap = el('div', { class: 'lthumb-wrap' }, t.canvas);
+    if (l.isText) wrap.append(el('span', { class: 'tbadge' }, 'T'));
+    return wrap;
   }
-  drawThumb(l, t) {
+  maskThumb(l) {
+    const key = l.id + ':m';
+    let t = this.thumbs.get(key);
+    if (!t) { t = { canvas: el('canvas', { class: 'lthumb mthumb', width: 96, height: 80 }), ref: null, ver: -1 }; this.thumbs.set(key, t); }
+    this.drawThumb(l.mask, l.ver, t, true);
+    return el('div', { class: 'lthumb-wrap mask' }, t.canvas);
+  }
+  drawThumb(src, ver, t, isMask) {
     const doc = this.app.doc;
-    if (t.ref === l.canvas && t.ver === l.ver && t.w === doc.width && t.h === doc.height) return;
+    if (!src || (t.ref === src && t.ver === ver && t.w === doc.width && t.h === doc.height)) return;
     const c = t.canvas, g = ctx2d(c);
     g.clearRect(0, 0, c.width, c.height);
     const s = Math.min(c.width / doc.width, c.height / doc.height);
     const w = doc.width * s, h = doc.height * s;
     g.imageSmoothingQuality = 'medium';
-    g.drawImage(l.canvas, (c.width - w) / 2, (c.height - h) / 2, w, h);
-    t.ref = l.canvas; t.ver = l.ver; t.w = doc.width; t.h = doc.height;
+    if (isMask) { g.fillStyle = '#000'; g.fillRect((c.width - w) / 2, (c.height - h) / 2, w, h); }
+    g.drawImage(src, (c.width - w) / 2, (c.height - h) / 2, w, h);
+    t.ref = src; t.ver = ver; t.w = doc.width; t.h = doc.height;
   }
   updateThumbs() {
     const doc = this.app.doc;
     if (!doc) return;
-    for (const l of doc.layers) { const t = this.thumbs.get(l.id); if (t) this.drawThumb(l, t); }
+    for (const l of doc.layers) {
+      const t = this.thumbs.get(String(l.id));
+      if (t && l.canvas) this.drawThumb(l.canvas, l.ver, t, false);
+      const m = this.thumbs.get(l.id + ':m');
+      if (m && l.mask) this.drawThumb(l.mask, l.ver, m, true);
+    }
   }
   menu(l, anchor) {
     const doc = this.app.doc;
     doc.setActive(l);
+    const c = (cmd) => () => this.app.cmd(cmd);
     openMenu(anchor, [
-      { label: '名前を変更', action: () => this.app.cmd('layer.rename') },
-      { label: '複製', action: () => this.app.cmd('layer.duplicate') },
-      { label: '下と結合', action: () => this.app.cmd('layer.mergeDown'), disabled: doc.indexOf(l) === 0 },
+      l.isText ? { label: '文字を直す', action: c('layer.edit') } : l.isAdjustment ? { label: '調整を直す', action: c('layer.edit') } : null,
+      { label: '名前を変更', action: c('layer.rename') },
+      { label: '複製', action: c('layer.duplicate') },
+      { label: '下と結合', action: c('layer.mergeDown'), disabled: doc.siblings(l)[0] === l || l.isGroup },
       '-',
-      { label: '左右反転', action: () => this.app.cmd('layer.flipH') },
-      { label: '上下反転', action: () => this.app.cmd('layer.flipV') },
-      { label: 'レイヤーの不透明部分を選択', action: () => this.app.cmd('select.layerAlpha') },
+      { label: 'レイヤースタイル…', action: c('layer.styles'), disabled: !l.canvas },
+      { label: l.clip ? 'クリッピングマスクを解除' : 'クリッピングマスクを作成', action: c('layer.clip') },
+      l.mask ? { label: 'マスクを削除', action: c('mask.delete') } : { label: 'マスクを追加', action: c('mask.add') },
+      l.isGroup ? { label: 'グループ解除', action: c('layer.ungroup') } : { label: 'グループ化', action: c('layer.group') },
+      (l.isText || l.hasStyles()) ? { label: 'ラスタライズ', action: c('layer.rasterize') } : null,
       '-',
-      { label: '削除', action: () => this.app.cmd('layer.delete'), disabled: doc.layers.length <= 1 },
-    ]);
+      { label: '左右反転', action: c('layer.flipH') },
+      { label: '上下反転', action: c('layer.flipV') },
+      { label: 'レイヤーの不透明部分を選択', action: c('select.layerAlpha') },
+      '-',
+      { label: '削除', action: c('layer.delete') },
+    ].filter((x) => x !== null));
   }
   longPress(node, fn) {
     let t = 0, sx = 0, sy = 0;
     node.addEventListener('pointerdown', (e) => {
-      if (e.pointerType !== 'touch' || e.target.closest('.handle, .eye')) return;
+      if (e.pointerType !== 'touch' || e.target.closest('.handle, .eye, .twisty')) return;
       sx = e.clientX; sy = e.clientY;
       t = setTimeout(() => { t = 0; node._longPressed = true; fn(); }, 550);
     });
@@ -289,7 +368,7 @@ class LayersPanel {
     node.addEventListener('pointercancel', () => stop());
     node.addEventListener('click', (e) => { if (node._longPressed) { node._longPressed = false; e.stopImmediatePropagation(); } }, true);
   }
-  /** ≡ をつかんで上下に動かすと並べ替え */
+  /** ≡ をつかんで上下に動かすと並べ替え（開いたグループの見出しの下半分に落とすとグループの中へ） */
   dragHandle(h, layer) {
     h.addEventListener('pointerdown', (e) => {
       e.preventDefault(); e.stopPropagation();
@@ -323,9 +402,10 @@ class LayersPanel {
         if (!target || target === li) return;
         const doc = this.app.doc;
         const other = doc.layerById(Number(target.dataset.id));
-        let to = doc.indexOf(other) + (place === 'above' ? 1 : 0);     // リストは上が前面
-        if (doc.indexOf(layer) < to) to -= 1;
-        doc.moveLayer(layer, to);
+        if (!other || other === layer || doc.isInside(other, layer)) return;
+        // リストは上が前面。見出しの下 = グループの中の一番上（開いているグループ）
+        if (place === 'below' && other.isGroup && !other.group.collapsed) doc.placeLayer(layer, other, 'into');
+        else doc.placeLayer(layer, other, place === 'above' ? 'above' : 'below');
       };
       h.addEventListener('pointermove', move);
       h.addEventListener('pointerup', up);

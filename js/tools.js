@@ -13,7 +13,8 @@ class Tool {
   get view() { return this.app.view; }
   setOpt(k, v) { this.opts[k] = v; LS.set('tool.' + this.name, this.opts); }
   spec() { return []; }
-  needsLayer() { return true; }       // 描き込み先のレイヤーが要るか
+  /** 要るレイヤー: false / 'paint'（画素かマスクに描く）/ 'pixels'（画素だけ）/ 'move'（画素かテキスト） */
+  needsLayer() { return 'paint'; }
   down() {} move() {} up() {}
   cancel() {}
 }
@@ -103,7 +104,10 @@ class BrushTool extends Tool {
   }
   down(p) {
     const d = this.doc;
-    this.layer = d.active;
+    const t = this.app.paintTarget();
+    if (typeof t === 'string') { toast(t, { error: true }); return; }
+    this.layer = t.layer;
+    this.attr = t.attr;                    // 'canvas'（画素）か 'mask'
     this.buf = this.app.scratch('stroke');
     this.bg = ctx2d(this.buf);
     this.bg.clearRect(0, 0, d.width, d.height);
@@ -115,7 +119,7 @@ class BrushTool extends Tool {
     this.carry = 0;
     this.pressureSeen = p.type === 'pen';
     const layer = this.layer;
-    d.live = { layer, canvas: this.liveC, update: (r) => this.updateLive(r) };
+    d.live = { layer, [this.attr === 'mask' ? 'mask' : 'canvas']: this.liveC, update: (r) => this.updateLive(r) };
     this.dab(p.x, p.y, p.pressure);
     this.flushDirty();
   }
@@ -186,9 +190,10 @@ class BrushTool extends Tool {
   flushDirty() {
     if (this.pending) { this.doc.invalidate(this.pending, 'live'); this.pending = null; }
   }
-  /** 描き方（消しゴム・透明部分ロック） */
+  /** 描き方（消しゴム・透明部分ロック・マスク） */
   mode() {
     const l = this.layer;
+    if (this.attr === 'mask') return { mask: true, gray: grayOf(this.eraser ? this.app.bg : this.app.fg) };
     if (this.eraser) return l.alpha_locked ? { gco: 'source-atop', color: this.app.bg } : { gco: 'destination-out' };
     return { gco: l.alpha_locked ? 'source-atop' : 'source-over' };
   }
@@ -196,7 +201,7 @@ class BrushTool extends Tool {
     const m = this.mode();
     const grain = this.preset.grain;
     let src = this.buf;
-    if (m.color || grain > 0) {
+    if (m.color || grain > 0 || m.mask) {
       // 紙の質感（紙に固定した模様で筆跡を削る）・透明部分ロック中の消しゴム（背景色で塗る）は作業用 canvas で作る
       const tmp = this.app.scratch('tint');
       const tg = ctx2d(tmp);
@@ -217,6 +222,7 @@ class BrushTool extends Tool {
       tg.restore();
       src = tmp;
     }
+    if (m.mask) { paintMask(g, src, r, this.opts.opacity / 100, m.gray); return; }    // マスク: 明るさを fg（消しゴムは bg）へ寄せる
     g.save();
     g.globalAlpha = this.opts.opacity / 100;
     g.globalCompositeOperation = m.gco;
@@ -226,7 +232,7 @@ class BrushTool extends Tool {
   updateLive(r) {
     const g = ctx2d(this.liveC);
     g.clearRect(r.x, r.y, r.w, r.h);
-    g.drawImage(this.layer.canvas, r.x, r.y, r.w, r.h, r.x, r.y, r.w, r.h);
+    g.drawImage(this.layer[this.attr], r.x, r.y, r.w, r.h, r.x, r.y, r.w, r.h);
     this.applyTo(g, r);
   }
   commit() {
@@ -234,9 +240,9 @@ class BrushTool extends Tool {
     const d = this.doc;
     d.live = null;
     if (!this.dirty) return;
-    d.beginPixels(this.layer);
-    this.applyTo(this.layer.ctx, this.dirty);
-    d.endPixels(this.label, this.dirty);
+    d.beginPixels(this.layer, this.attr);
+    this.applyTo(ctx2d(this.layer[this.attr]), this.dirty);
+    d.endPixels(this.attr === 'mask' ? this.label + '（マスク）' : this.label, this.dirty);
   }
   drawOverlay(g, view) {
     if (this.active || !view.hover) return;
@@ -291,7 +297,7 @@ function grainTexture(strength, scale) {
 class EyedropperTool extends Tool {
   constructor(app) { super(app, 'eyedropper', 'スポイト', { source: 'all' }); this.showsHover = true; }
   spec() { return [{ key: 'source', type: 'seg', items: [['all', '全レイヤー'], ['layer', '現在のレイヤー']] }]; }
-  needsLayer() { return this.opts.source === 'layer'; }
+  needsLayer() { return this.opts.source === 'layer' ? 'pixels' : false; }
   pick(p) {
     const d = this.doc;
     const x = Math.floor(p.x), y = Math.floor(p.y);
@@ -337,11 +343,17 @@ class FillTool extends Tool {
     ];
   }
   down(p) {
-    const d = this.doc, layer = d.active;
+    const d = this.doc;
+    const t = this.app.paintTarget();
+    if (typeof t === 'string') { toast(t, { error: true }); return; }
+    const layer = t.layer, onMask = t.attr === 'mask';
     const W = d.width, H = d.height;
     if (p.x < 0 || p.y < 0 || p.x >= W || p.y >= H) return;
-    const src = this.opts.allLayers ? d.composite() : layer.canvas;
-    const data = ctx2d(src).getImageData(0, 0, W, H).data;
+    let data;
+    if (onMask) {            // マスクの明るさで範囲を決める
+      data = ctx2d(layer.mask).getImageData(0, 0, W, H).data;
+      for (let i = 0; i < data.length; i += 4) { data[i] = data[i + 1] = data[i + 2] = data[i + 3]; data[i + 3] = 255; }
+    } else data = ctx2d(this.opts.allLayers ? d.composite() : layer.canvas).getImageData(0, 0, W, H).data;
     let mask = regionMask(data, W, H, p.x, p.y, this.opts.tolerance, this.opts.contiguous);
     if (this.opts.gap) mask = dilate1(mask, W, H);
     const selA = d.sel ? Sel.alphaOf(d.sel, W, H) : null;
@@ -364,6 +376,10 @@ class FillTool extends Tool {
     if (maxX < 0) return;
     ctx2d(fill).putImageData(img, 0, 0);
     const rect = { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 };
+    if (onMask) {
+      d.editPixels('塗りつぶし（マスク）', layer, rect, (gm) => paintMask(gm, fill, rect, this.opts.opacity / 100, grayOf(this.app.fg)), { attr: 'mask' });
+      return;
+    }
     d.editPixels('塗りつぶし', layer, rect, (gc) => {
       gc.globalAlpha = this.opts.opacity / 100;
       gc.globalCompositeOperation = layer.alpha_locked ? 'source-atop' : 'source-over';
@@ -400,9 +416,29 @@ class GradientTool extends Tool {
     const a = this.a, b = snap45(a, p, p.shift);
     this.a = this.b = null;
     if (Math.hypot(b.x - a.x, b.y - a.y) < 2) { this.view.request(); return; }
-    const d = this.doc, layer = d.active;
+    const d = this.doc;
+    const t = this.app.paintTarget();
+    if (typeof t === 'string') { toast(t, { error: true }); return; }
+    const layer = t.layer;
     const W = d.width, H = d.height;
     const tmp = newCanvas(W, H), g = ctx2d(tmp);
+    if (t.attr === 'mask') {
+      const g0 = grayOf(this.app.fg), g1 = this.opts.colors === 'fgbg' ? grayOf(this.app.bg) : 0;
+      const gr = this.opts.kind === 'radial' ? g.createRadialGradient(a.x, a.y, 0, a.x, a.y, Math.hypot(b.x - a.x, b.y - a.y)) : g.createLinearGradient(a.x, a.y, b.x, b.y);
+      gr.addColorStop(0, `rgba(255,255,255,${g0})`); gr.addColorStop(1, `rgba(255,255,255,${g1})`);
+      g.fillStyle = gr; g.fillRect(0, 0, W, H);
+      const region = d.sel ? d.sel.canvas : null;
+      if (region) { g.globalCompositeOperation = 'destination-in'; g.drawImage(region, 0, 0); }
+      const op = this.opts.opacity / 100;
+      d.editPixels('グラデーション（マスク）', layer, d.sel ? d.sel.bounds : d.fullRect, (gm) => {
+        gm.globalAlpha = op;
+        gm.globalCompositeOperation = 'destination-out';
+        if (region) gm.drawImage(region, 0, 0); else { gm.fillStyle = '#fff'; gm.fillRect(0, 0, W, H); }
+        gm.globalCompositeOperation = 'lighter';
+        gm.drawImage(tmp, 0, 0);
+      }, { attr: 'mask' });
+      return;
+    }
     const grad = this.opts.kind === 'radial'
       ? g.createRadialGradient(a.x, a.y, 0, a.x, a.y, Math.hypot(b.x - a.x, b.y - a.y))
       : g.createLinearGradient(a.x, a.y, b.x, b.y);
@@ -551,7 +587,7 @@ class WandTool extends Tool {
       { key: 'contiguous', label: '隣接', type: 'check' },
       { key: 'allLayers', label: '全レイヤーを対象', type: 'check' }];
   }
-  needsLayer() { return !this.opts.allLayers; }
+  needsLayer() { return this.opts.allLayers ? false : 'pixels'; }
   down(p) {
     const d = this.doc;
     const W = d.width, H = d.height;
@@ -568,33 +604,52 @@ class WandTool extends Tool {
 // ---- 移動 ------------------------------------------------------------------------
 class MoveTool extends Tool {
   constructor(app) { super(app, 'move', '移動', {}); }
+  needsLayer() { return 'move'; }
+  /** 何を動かすか: attr = 'canvas'（画素）か 'mask'、withMask = マスクも一緒に */
+  plan() {
+    const d = this.doc, l = d.active;
+    if (d.editingMask && l.mask) return { attr: 'mask', withMask: false, sel: d.sel };
+    if (l.isText) return { attr: 'canvas', withMask: !!l.mask, sel: null };
+    return { attr: 'canvas', withMask: !!l.mask && !d.sel, sel: d.sel };
+  }
+  split(layer, attr, sel) {
+    const W = this.doc.width, H = this.doc.height;
+    const float = cloneCanvas(layer[attr]), base = newCanvas(W, H);
+    if (sel) {
+      const fg = ctx2d(float); fg.globalCompositeOperation = 'destination-in'; fg.drawImage(sel.canvas, 0, 0);
+      const bg = ctx2d(base); bg.drawImage(layer[attr], 0, 0); bg.globalCompositeOperation = 'destination-out'; bg.drawImage(sel.canvas, 0, 0);
+    }
+    return { float, base };
+  }
   spec() { return [{ type: 'note', text: 'ドラッグでレイヤー（選択範囲があればその中身）を動かす。キーボードの矢印でも 1px（Shift で 10px）' }]; }
   down(p) {
     const d = this.doc, layer = d.active;
     this.layer = layer;
     this.start = p;
     this.dx = 0; this.dy = 0;
-    const W = d.width, H = d.height;
-    this.float = cloneCanvas(layer.canvas);
-    this.base = newCanvas(W, H);
-    if (d.sel) {
-      const fg = ctx2d(this.float);
-      fg.globalCompositeOperation = 'destination-in';
-      fg.drawImage(d.sel.canvas, 0, 0);
-      const bg = ctx2d(this.base);
-      bg.drawImage(layer.canvas, 0, 0);
-      bg.globalCompositeOperation = 'destination-out';
-      bg.drawImage(d.sel.canvas, 0, 0);
-    }
+    this.pl = this.plan();
+    const { float, base } = this.split(layer, this.pl.attr, this.pl.sel);
+    this.float = float; this.base = base;
     this.liveC = this.app.scratch('live');
-    d.live = { layer, canvas: this.liveC, update: (r) => this.updateLive(r) };
-    this.hideAnts = !!d.sel;
+    d.live = { layer, update: (r) => this.updateLive(r) };
+    d.live[this.pl.attr] = this.liveC;
+    if (this.pl.withMask) { this.liveM = this.app.scratch('liveMask'); d.live.mask = this.liveM; }
+    this.hideAnts = !!this.pl.sel;
   }
   updateLive(r) {
     const g = ctx2d(this.liveC);
+    g.save();
+    g.beginPath(); g.rect(r.x, r.y, r.w, r.h); g.clip();
     g.clearRect(r.x, r.y, r.w, r.h);
-    g.drawImage(this.base, r.x, r.y, r.w, r.h, r.x, r.y, r.w, r.h);
+    g.drawImage(this.base, 0, 0);
     g.drawImage(this.float, this.dx, this.dy);
+    g.restore();
+    if (this.liveM) {
+      const m = ctx2d(this.liveM);
+      m.save(); m.beginPath(); m.rect(r.x, r.y, r.w, r.h); m.clip();
+      shiftedMaskInto(m, this.layer.mask, this.dx, this.dy, this.doc.width, this.doc.height);
+      m.restore();
+    }
   }
   move(p) {
     if (!this.start) return;
@@ -609,26 +664,37 @@ class MoveTool extends Tool {
     const { dx, dy } = this;
     this.start = null;
     this.hideAnts = false;
+    this.liveM = null;
     const d = this.doc;
     d.live = null;
     if (!dx && !dy) { d.invalidate(null, 'live'); return; }
-    this.commitOffset(this.layer, dx, dy, this.base, this.float);
+    this.commitOffset(this.layer, dx, dy, this.base, this.float, this.pl);
   }
   cancel() {
     if (!this.start) return;
-    this.start = null; this.hideAnts = false;
+    this.start = null; this.hideAnts = false; this.liveM = null;
     this.doc.live = null;
     this.doc.invalidate(null, 'live');
   }
   /** base の上に float を (dx, dy) ずらして置いた canvas に差し替える（選択範囲も一緒に動かす） */
-  commitOffset(layer, dx, dy, base, float) {
+  commitOffset(layer, dx, dy, base, float, pl = this.plan()) {
     const d = this.doc;
     const W = d.width, H = d.height;
-    d.change(this.label, () => {
-      const c = cloneCanvas(base);
-      ctx2d(c).drawImage(float, dx, dy);
-      layer.canvas = c;
-      if (d.sel) {
+    d.change(pl.attr === 'mask' ? '移動（マスク）' : this.label, () => {
+      if (layer.isText && pl.attr === 'canvas') {          // テキストは行列を動かして描き直す（ぼやけない）
+        layer.text = { ...layer.text, matrix: matMul([1, 0, 0, 1, dx, dy], layer.text.matrix) };
+        layer.canvas = renderTextSpec(layer.text, W, H);
+      } else {
+        const c = cloneCanvas(base);
+        ctx2d(c).drawImage(float, dx, dy);
+        layer[pl.attr] = c;
+      }
+      if (pl.withMask) {
+        const m = newCanvas(W, H);
+        shiftedMaskInto(ctx2d(m), layer.mask, dx, dy, W, H);
+        layer.mask = m;
+      }
+      if (pl.sel && d.sel) {
         const s = newCanvas(W, H);
         ctx2d(s).drawImage(d.sel.canvas, dx, dy);
         const b = Rect.intersect({ x: d.sel.bounds.x + dx, y: d.sel.bounds.y + dy, w: d.sel.bounds.w, h: d.sel.bounds.h }, d.fullRect);
@@ -639,14 +705,21 @@ class MoveTool extends Tool {
   nudge(dx, dy) {
     const d = this.doc, layer = d.active;
     if (!layer || this.app.cannotEdit(this)) return;
-    const W = d.width, H = d.height;
-    const float = cloneCanvas(layer.canvas), base = newCanvas(W, H);
-    if (d.sel) {
-      const fg = ctx2d(float); fg.globalCompositeOperation = 'destination-in'; fg.drawImage(d.sel.canvas, 0, 0);
-      const bg = ctx2d(base); bg.drawImage(layer.canvas, 0, 0); bg.globalCompositeOperation = 'destination-out'; bg.drawImage(d.sel.canvas, 0, 0);
-    }
-    this.commitOffset(layer, dx, dy, base, float);
+    const pl = this.plan();
+    const { float, base } = this.split(layer, pl.attr, pl.sel);
+    this.commitOffset(layer, dx, dy, base, float, pl);
   }
+}
+
+/** マスクを (dx, dy) ずらして描く（はみ出して空いた所は「見える」= 白） */
+function shiftedMaskInto(g, mask, dx, dy, W, H) {
+  g.save();
+  g.globalCompositeOperation = 'source-over';
+  g.fillStyle = '#fff';
+  g.fillRect(0, 0, W, H);
+  g.clearRect(dx, dy, W, H);
+  g.drawImage(mask, dx, dy);
+  g.restore();
 }
 
 class HandTool extends Tool {
@@ -671,18 +744,19 @@ const TOOL_ICONS = {
   fill: '<path d="M5 11 12 4l7 7-7 7z"/><path d="M5 11h14M20 16c0 1.5 1 2.5 1 3.5a1 1 0 0 1-2 0c0-1 1-2 1-3.5z"/>',
   gradient: '<rect x="4" y="5" width="16" height="14" rx="1"/><path d="M8 5v14M12 5v14M16 5v14" stroke-opacity=".5"/>',
   eyedropper: '<path d="M4 20l1-4 8-8 3 3-8 8z"/><path d="M13 8l2-2a2.1 2.1 0 0 1 3 3l-2 2"/>',
+  text: '<path d="M5 6V4h14v2M12 4v16M9 20h6"/>',
   transform: '<rect x="5" y="5" width="14" height="14" stroke-dasharray="2 2"/><path d="M3 3h4v4H3zM17 3h4v4h-4zM17 17h4v4h-4zM3 17h4v4H3z"/>',
   crop: '<path d="M6 2v16h16M2 6h16v16"/>',
   hand: '<path d="M8 13V6a1.5 1.5 0 0 1 3 0v6M11 11V4.5a1.5 1.5 0 0 1 3 0V11M14 11V6a1.5 1.5 0 0 1 3 0v8c0 4-2.5 6-6 6s-5-2-6.5-4.5L4 13a1.5 1.5 0 0 1 2.5-1.5L8 13"/>',
   zoom: '<circle cx="10.5" cy="10.5" r="6"/><path d="M15 15l5 5M8 10.5h5M10.5 8v5"/>',
 };
-const TOOL_KEYS = { transform: '⌘T', crop: 'C', move: 'V', marquee_rect: 'M', lasso: 'L', wand: 'W', brush: 'B', eraser: 'E', fill: 'G', gradient: 'G', eyedropper: 'I', hand: 'H', zoom: 'Z' };
+const TOOL_KEYS = { text: 'T', transform: '⌘T', crop: 'C', move: 'V', marquee_rect: 'M', lasso: 'L', wand: 'W', brush: 'B', eraser: 'E', fill: 'G', gradient: 'G', eyedropper: 'I', hand: 'H', zoom: 'Z' };
 
 function makeTools(app) {
   const list = [
     new MoveTool(app), new TransformTool(app), new CropTool(app), new MarqueeTool(app, false), new MarqueeTool(app, true), new LassoTool(app), new WandTool(app),
     null,
-    new BrushTool(app, false), new BrushTool(app, true), new FillTool(app), new GradientTool(app), new EyedropperTool(app),
+    new BrushTool(app, false), new BrushTool(app, true), new FillTool(app), new GradientTool(app), new EyedropperTool(app), new TextTool(app),
     null,
     new HandTool(app), new ZoomTool(app),
   ];

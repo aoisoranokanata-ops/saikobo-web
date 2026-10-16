@@ -12,12 +12,25 @@ class AdjustPanel {
   get doc() { return this.app.doc; }
   get open() { return !!this.spec; }
 
+  /** 調整レイヤーの値を直す（layer モード）: 変更はそのまま画面に出し、OK で before からの1手にする */
+  startLayer(layer, { before, label }) {
+    const spec = findSpec(layer.adjustment.key);
+    if (!spec) return;
+    if (this.open) this.cancel();
+    this.layerMode = { layer, before, label, wasVisible: layer.visible };
+    this.spec = spec;
+    this.layer = layer;
+    this.params = { ...defaultParams(spec), ...JSON.parse(JSON.stringify(layer.adjustment.params || {})) };
+    this.preview = true;
+    this.build();
+  }
   start(key) {
     const spec = findSpec(key);
     const d = this.doc;
     if (!spec || !d) return;
     if (this.open) this.cancel();
-    const why = this.app.cannotEdit(this.app.tools.brush);
+    this.layerMode = null;
+    const why = this.app.cannotEdit({ needsLayer: () => 'pixels' });
     if (why) { toast(why, { error: true }); return; }
     const remembered = spec.kind === 'filter' ? LS.get('filter.' + key, null) : null;
     const params = { ...defaultParams(spec), ...(remembered || {}) };
@@ -47,7 +60,7 @@ class AdjustPanel {
     const s = this.spec;
     const root = this.root;
     root.replaceChildren();
-    const head = el('div', { class: 'adj-head' }, el('span', { class: 'adj-title' }, s.label),
+    const head = el('div', { class: 'adj-head' }, el('span', { class: 'adj-title' }, (this.layerMode ? '調整レイヤー: ' : '') + s.label),
       el('button', { class: 'adj-x', 'aria-label': '小さくする', onclick: () => root.classList.toggle('mini') }, '▾'));
     root.append(head);
     const body = el('div', { class: 'adj-body' });
@@ -125,8 +138,8 @@ class AdjustPanel {
     const c = el('canvas', { class: 'adj-hist', width: 512, height: 512 });
     this.histC = c;
     const d = this.doc;
-    const rect = d.sel ? d.sel.bounds : d.fullRect;
-    this.hist = histogramOf(this.layer.canvas, rect, d.sel);
+    const rect = d.sel && !this.layerMode ? d.sel.bounds : d.fullRect;
+    this.hist = histogramOf(this.layerMode ? d.composite() : this.layer.canvas, rect, this.layerMode ? null : d.sel);
     if (this.spec.ui === 'curves') this.curveEvents(c);
     else c.height = 200;
     setTimeout(() => this.drawHist(), 0);
@@ -221,6 +234,14 @@ class AdjustPanel {
   compute() {
     if (!this.spec) return;
     const d = this.doc;
+    if (this.layerMode) {               // 調整レイヤー: 値を差し替えるだけ（合成が計算する）
+      const L = this.layerMode.layer;
+      L.adjustment = { key: this.spec.key, params: JSON.parse(JSON.stringify(this.params)) };
+      L.visible = this.preview ? this.layerMode.wasVisible : false;
+      this.busy.hidden = true;
+      d.invalidate(null, 'live');
+      return;
+    }
     const g = ctx2d(this.liveC);
     if (this.lastRect) {            // 前回の結果を元に戻す
       const r = this.lastRect;
@@ -241,6 +262,16 @@ class AdjustPanel {
   ok() {
     const d = this.doc, spec = this.spec;
     clearTimeout(this._timer);
+    if (this.layerMode) {
+      const lm = this.layerMode;
+      this.preview = true;
+      this.compute();
+      lm.layer.visible = lm.wasVisible;
+      this.layerMode = null;
+      this.close();
+      d.commitFrom(lm.label, lm.before);
+      return;
+    }
     let res = this.result;
     if (!res || res.key !== JSON.stringify(this.params)) res = runSpec(spec, this.params, this.layer, d.sel, d.width, d.height);
     this.close();
@@ -252,6 +283,13 @@ class AdjustPanel {
   }
   cancel() {
     clearTimeout(this._timer);
+    if (this.layerMode) {
+      const lm = this.layerMode;
+      this.layerMode = null;
+      this.close();
+      this.doc.restore(lm.before);         // 作る前・直す前に戻す（履歴には残さない）
+      return;
+    }
     this.close();
     this.doc && this.doc.invalidate(null, 'live');
   }

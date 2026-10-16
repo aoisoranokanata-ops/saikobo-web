@@ -58,6 +58,25 @@ PSD は後回し（フェーズ4で検討）、16bit・ICC 変換（ブラウザ
   平行四辺形なら canvas の transform 1回、そうでなければ射影変換を n×n の三角形に分けて描く（隙間対策で三角形を 0.7px 広げる）。
   確定は新しい canvas に差し替える change 1手、選択範囲も同じ変換。確定・キャンセル後は前の道具に戻る（prevTool）。
 
+## 設計の要点（フェーズ3: 非破壊）
+- レイヤーの属性は exe と同じ名前: mask_enabled・text・adjustment・styles・clip・group・parent（`LAYER_PROPS`）。辞書は差し替えて使う。
+  グループ・調整レイヤーは `canvas = null`（画素なし。.sko でも file: null）。`layer.kind` / `isGroup` / `isAdjustment` / `isText`。
+- **doc.layers は一列のまま**、グループの中身は本体の真下に連続（exe・PSD と同じ）。並べ替えは `blockRange()` 単位で
+  `placeLayer(layer, anchor, 'above'|'below'|'into')`、▲▼は `moveLayer(layer, 'up'|'down')`（端でグループの外へ）。`checkTree()` で検査。
+- 合成は js/layerfx.js（exe core/blend.py と同じ順序）: 木にして再帰、通過グループは外と直接、通常グループは中だけで合成して重ねる、
+  クリッピングは直前の土台の形（土台が非表示なら一緒に消える）、調整レイヤーはそこまでの結果を読み出して補正し、マスク×不透明度で混ぜる。
+  **作業用 canvas はすべて「合成範囲 rect の大きさ」**（(0,0) = rect の左上）。文書大の一時 canvas を増やさない（iPad のメモリ）。
+- マスク = 白・アルファ（見える度合い）の canvas。保存は exe と同じ灰色 PNG（`maskToGray` / `maskFromImage` は両形式を読める）。
+  マスクへの描き込みは `paintMask`: destination-out で減らしてから lighter で白を足す（new = old·(1−a) + 灰色·a）。
+  描く道具の描き込み先は `app.paintTarget()`（マスク編集中・調整レイヤー → マスク。調整レイヤーにマスクが無ければ自動で作る）。
+- スタイルは exe と同じ5種・同じ重ね順。ぼかしは canvas の影（shadowBlur = サイズ、σ = サイズ/2 で exe と同じ）を「本体は画面外・影だけ落とす」で使う。
+  境界線・スプレッドは距離変換（selection.js の distanceTransform）で太らせる・細らせる。
+- テキストは exe と同じ spec（text, font, size, color, bold, italic, align, line_spacing, matrix）。行送り = (ascent+descent)·line_spacing。
+  画素は spec から描き直す（移動・自由変形・画像全体の回転/拡大は行列を変えて描き直すのでぼやけない）。exe で描いた画素は直すまでそのまま。
+  フォント名は exe（Windows）と iPad で違うので、無いものは「ヒラギノ角ゴ → 游ゴシック → sans-serif」に落ちる。
+- 「開いて値を変える」画面（スタイル・テキスト・調整レイヤー）は、開いた時の `doc.snapshot()` を持ち、値は直接レイヤーに入れて画面に出す。
+  OK で `doc.commitFrom(label, before)` の1手、キャンセルで `doc.restore(before)`（履歴に残さない）。
+
 ## ハマり所（実測）
 - **Uint8ClampedArray は代入時に四捨五入する**（偶数丸め）。`v + 0.5` を足すと半段ずれる（反転で 127 が 128 になった）。
   Uint8Array（切り捨て）とは違うので、書き込み先の型で丸め方を変えること。
@@ -71,7 +90,8 @@ PSD は後回し（フェーズ4で検討）、16bit・ICC 変換（ブラウザ
 
 ## テスト
 - `tools/selftest.js`: 疑似的なペン・タッチ入力で確かめる。`saikoboSelfTest()`（フェーズ1: 描画・ジェスチャー・選択・移動・レイヤー・
-  画像操作・保存/読み込み 30項目）と `saikoboSelfTest2()`（フェーズ2: ペンの種類・補正パネル・フィルター・自由変形・切り抜き 24項目）。
+  画像操作・保存/読み込み 30項目）と `saikoboSelfTest2()`（フェーズ2: ペンの種類・補正パネル・フィルター・自由変形・切り抜き 24項目）、
+  `saikoboSelfTest3()`（フェーズ3: マスク・クリッピング・グループ・調整レイヤー・スタイル・テキスト・保存の往復 37項目）。
   プレビューで `<script src="/tools/selftest.js">` を読み込んでから await で呼ぶ。終わると作った作品は消す。
 - exe と同じ結果か: `python tools/make_fixtures.py` → プレビューで fixtures/input.png に `findSpec(key).fn` をかけ、index.json の各期待値 PNG と不透明部分の差を見る（2026-10-16 時点で ±1）。
 - アイコン: `python tools/make_icons.py`（exe 版と同じ絵）

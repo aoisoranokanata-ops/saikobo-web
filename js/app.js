@@ -1,7 +1,7 @@
 'use strict';
 /* アプリ本体: 画面の切り替え・コマンド・メニュー・キーボード・自動保存 */
 
-const APP_VERSION = '0.2.1';
+const APP_VERSION = '0.3.0';
 
 class App {
   constructor() {
@@ -18,6 +18,7 @@ class App {
     this.layersPanel = new LayersPanel(this);
     this.colorPanel = new ColorPanel(this);
     this.adjust = new AdjustPanel(this);
+    this.layerUI = new LayerUI(this);
     this.lastFilter = null;
     this.prevTool = null;
     this._scratch = {};
@@ -93,18 +94,42 @@ class App {
   /** 変形中・補正パネル表示中なら、ほかの操作の前に確定（変形）・取り消し（補正）する */
   settle({ commit = true } = {}) {
     if (this.adjust.open) this.adjust.cancel();
+    if (this.layerUI.open) this.layerUI.cancel();
     const t = this.tool;
     if (t && t.state) { if (commit) t.commit(); else t.cancelAll(); }
   }
+  /** 道具が使えない理由（使えれば null）。needsLayer: 'paint' / 'pixels' / 'move' / false */
   cannotEdit(tool) {
     const d = this.doc;
     if (!d) return '作品が開かれていません';
-    if (!tool.needsLayer()) return null;
+    const need = tool.needsLayer();
+    if (!need) return null;
     const l = d.active;
     if (!l) return 'レイヤーを選んでください';
     if (l.locked) return 'このレイヤーはロックされています（レイヤーパネルの「すべてロック」）';
     if (!l.visible) return '非表示のレイヤーには描けません';
+    if (need === 'paint') { const t = this.paintTarget({ create: false }); return typeof t === 'string' ? t : null; }
+    if (d.editingMask && l.mask && need === 'move') return null;
+    if (l.isGroup) return 'グループには使えません。中のレイヤーを選んでください';
+    if (l.isAdjustment) return '調整レイヤーには使えません（マスクを選ぶとマスクに描けます）';
+    if (need === 'pixels' && l.isText) return 'テキストレイヤーには使えません（レイヤー ＞ ラスタライズ）';
+    if (need === 'pixels' && d.editingMask) return 'マスクの編集中は使えません（レイヤーの絵をタップして戻す）';
     return null;
+  }
+  /** 描き込み先 {layer, attr: 'canvas' | 'mask'}。描けなければ理由の文字列。調整レイヤーは必要ならマスクを作る */
+  paintTarget({ create = true } = {}) {
+    const d = this.doc, l = d && d.active;
+    if (!l) return 'レイヤーを選んでください';
+    if (l.locked) return 'このレイヤーはロックされています';
+    if (!l.visible) return '非表示のレイヤーには描けません';
+    if (d.editingMask && l.mask) return { layer: l, attr: 'mask' };
+    if (l.isAdjustment) {
+      if (!l.mask) { if (!create) return { layer: l, attr: 'mask' }; d.addMask(l); }     // 確かめるだけならまだ作らない
+      return { layer: l, attr: 'mask' };
+    }
+    if (l.isGroup) return l.mask ? 'グループのマスクをタップしてから描いてください' : 'グループには描けません（中のレイヤーを選ぶか、マスクを追加）';
+    if (l.isText) return 'テキストレイヤーには描けません（レイヤー ＞ ラスタライズ、またはマスクを追加）';
+    return { layer: l, attr: 'canvas' };
   }
   brushSize(dir) {
     const t = this.tool;
@@ -215,6 +240,7 @@ class App {
   undo() {
     if (!this.doc || this.view.mode === 'tool') return;
     if (this.adjust.open) { this.adjust.cancel(); return; }
+    if (this.layerUI.open) { this.layerUI.cancel(); return; }
     if (this.tool && this.tool.state) { this.tool.cancelAll(); this.hint('変形を取り消しました'); return; }
     const l = this.doc.history.undo();
     if (l) this.hint('取り消し: ' + l);
@@ -385,11 +411,7 @@ class App {
     const g = ctx2d(c);
     g.imageSmoothingQuality = 'high';
     g.drawImage(img, (d.width - w) / 2, (d.height - h) / 2, w, h);
-    d.change('画像を配置', () => {
-      const l = new Layer(d.width, d.height, name, c);
-      d.layers.splice(d.indexOf(d.active) + 1, 0, l);
-      d.activeId = l.id;
-    });
+    d.addLayer(name, { canvas: c, label: '画像を配置' });
     if (s < 1) toast('画像を作品の大きさに合わせて縮めました');
     this.selectTool('move');
   }
@@ -400,7 +422,8 @@ class App {
     const b = d.sel ? d.sel.bounds : d.fullRect;
     const c = newCanvas(b.w, b.h);
     const g = ctx2d(c);
-    g.drawImage(layer ? layer.canvas : d.flattened(), -b.x, -b.y);
+    const src = !layer ? d.flattened() : layer.canvas || d.flattened({ layers: d.block(layer) });
+    g.drawImage(src, -b.x, -b.y);
     if (d.sel) { g.globalCompositeOperation = 'destination-in'; g.drawImage(d.sel.canvas, -b.x, -b.y); }
     return { canvas: c, x: b.x, y: b.y };
   }
@@ -428,19 +451,22 @@ class App {
     const c = newCanvas(d.width, d.height);
     const inside = x + canvas.width <= d.width && y + canvas.height <= d.height;
     ctx2d(c).drawImage(canvas, inside ? x : Math.round((d.width - canvas.width) / 2), inside ? y : Math.round((d.height - canvas.height) / 2));
-    d.change('ペースト', () => {
-      const l = new Layer(d.width, d.height, d.nextLayerName(), c);
-      d.layers.splice(d.indexOf(d.active) + 1, 0, l);
-      d.activeId = l.id;
-    });
+    d.addLayer(d.nextLayerName(), { canvas: c, label: 'ペースト' });
     this.selectTool('move');
   }
   clearSelection(label = '消去') {
     const d = this.doc;
-    const l = d.active;
-    const why = this.cannotEdit(this.tools.brush);
-    if (why) { toast(why, { error: true }); return; }
+    const t = this.paintTarget();
+    if (typeof t === 'string') { toast(t, { error: true }); return; }
+    const l = t.layer;
     const rect = d.sel ? d.sel.bounds : d.fullRect;
+    if (t.attr === 'mask') {            // マスクの消去 = 隠す（黒）
+      d.editPixels(label + '（マスク）', l, rect, (g) => {
+        g.globalCompositeOperation = 'destination-out';
+        if (d.sel) g.drawImage(d.sel.canvas, 0, 0); else g.clearRect(0, 0, d.width, d.height);
+      }, { attr: 'mask' });
+      return;
+    }
     d.editPixels(label, l, rect, (g) => {
       if (l.alpha_locked) {
         g.globalCompositeOperation = 'source-atop';
@@ -462,10 +488,16 @@ class App {
     return c;
   }
   fillSelection(color, label) {
-    const d = this.doc, l = d.active;
-    const why = this.cannotEdit(this.tools.brush);
-    if (why) { toast(why, { error: true }); return; }
+    const d = this.doc;
+    const t = this.paintTarget();
+    if (typeof t === 'string') { toast(t, { error: true }); return; }
+    const l = t.layer;
     const c = this.selFilled(color);
+    if (t.attr === 'mask') {
+      const r = d.sel ? d.sel.bounds : d.fullRect;
+      d.editPixels(label + '（マスク）', l, r, (g) => paintMask(g, c, d.fullRect, 1, grayOf(color)), { attr: 'mask' });
+      return;
+    }
     d.editPixels(label, l, d.sel ? d.sel.bounds : d.fullRect, (g) => {
       g.globalCompositeOperation = l.alpha_locked ? 'source-atop' : 'source-over';
       g.drawImage(c, 0, 0);
@@ -474,6 +506,8 @@ class App {
   layerVia(cut) {
     const d = this.doc, l = d.active;
     if (!l) return;
+    const why = this.cannotEdit({ needsLayer: () => 'pixels' });
+    if (why) { toast(why, { error: true }); return; }
     if (cut && l.locked) { toast('このレイヤーはロックされています', { error: true }); return; }
     const W = d.width, H = d.height;
     d.change(cut ? 'カットしたレイヤー' : 'コピーしたレイヤー', () => {
@@ -487,7 +521,7 @@ class App {
         }
       } else if (cut) l.canvas = newCanvas(W, H);
       const nl = new Layer(W, H, cut ? l.name + '（カット）' : l.name + '（コピー）', c);
-      d.layers.splice(d.indexOf(l) + 1, 0, nl);
+      d.insertAbove(nl, l);
       d.activeId = nl.id;
     });
   }
@@ -606,14 +640,59 @@ class App {
       'image.trim': () => this.trim(),
       'image.flatten': () => d.flatten(),
       'layer.new': () => d.addLayer(),
+      'layer.newGroup': () => d.newGroup(),
+      'layer.group': () => d.groupLayer(),
+      'layer.ungroup': () => { if (d.active.isGroup) d.ungroup(d.active); else toast('グループを選んでください'); },
+      'layer.mergeGroup': () => { if (d.active.isGroup) d.mergeGroup(d.active); else toast('グループを選んでください'); },
+      'layer.clip': () => {
+        const l = d.active;
+        if (!l.clip && d.isBottomOfParent(l)) { toast('一番下のレイヤーはクリッピングできません（下のレイヤーの形で切り抜く機能です）'); return; }
+        d.setLayerProps(l, { clip: !l.clip }, l.clip ? 'クリッピングマスクを解除' : 'クリッピングマスクを作成');
+      },
+      'layer.styles': () => this.layerUI.openStyles(),
+      'layer.adjustNew': () => this.adjustLayerMenu(),
+      'layer.edit': () => this.layerUI.editLayer(d.active),
+      'layer.rasterize': () => {
+        const l = d.active;
+        if (!l.isText && !l.hasStyles()) { toast('ラスタライズするもの（テキスト・スタイル）がありません'); return; }
+        d.change(l.isText ? 'テキストをラスタライズ' : 'スタイルをラスタライズ', () => {
+          if (l.hasStyles()) {
+            const copy = Object.assign(Object.create(Object.getPrototypeOf(l)), l, { blend: 'normal', opacity: 1, clip: false, parent: null, visible: true });
+            copy.mask = null;
+            l.canvas = d.flattened({ layers: [copy] });
+            l.styles = null;
+          }
+          l.text = null;
+        });
+      },
+      'mask.add': () => d.addMask(d.active),
+      'mask.addSel': () => { if (d.sel) d.addMask(d.active, { fromSelection: true }); else toast('先に範囲を選択してください'); },
+      'mask.hide': () => d.addMask(d.active, { hide: true }),
+      'mask.delete': () => d.deleteMask(d.active),
+      'mask.apply': () => { if (d.active.canvas && !d.active.isText) d.deleteMask(d.active, true); else toast('このレイヤーには適用できません（削除はできます）'); },
+      'mask.toggle': () => { const l = d.active; if (l.mask) d.setLayerProps(l, { mask_enabled: l.mask_enabled === false }, l.mask_enabled === false ? 'マスクを有効に' : 'マスクを無効に'); },
+      'mask.edit': () => { const l = d.active; if (!l.mask) return; d.editingMask = !d.editingMask; d.emit('layers'); this.hint(d.editingMask ? 'マスクを編集中（黒で隠す・白で見せる）' : 'レイヤーの絵を編集中'); },
+      'mask.invert': () => {
+        const l = d.active;
+        if (!l.mask) return;
+        d.change('マスクを反転', () => {
+          const m = newCanvas(d.width, d.height), g = ctx2d(m);
+          g.fillStyle = '#fff'; g.fillRect(0, 0, d.width, d.height);
+          g.globalCompositeOperation = 'destination-out';
+          g.drawImage(l.mask, 0, 0);
+          l.mask = m;
+        });
+      },
+      'mask.toSel': () => { const l = d.active; if (l.mask) d.setSelection(Sel.fromCanvas(cloneCanvas(l.mask)), 'マスクを選択範囲に'); },
       'layer.duplicate': () => d.duplicateLayer(),
       'layer.delete': () => { if (!d.deleteLayer()) toast('最後のレイヤーは削除できません'); },
+      'text.tool': () => this.selectTool('text'),
       'layer.rename': async () => { const l = d.active; const n = await promptDialog('レイヤー名', l.name); if (n && n.trim() && n.trim() !== l.name) d.setLayerProps(l, { name: n.trim() }, 'レイヤー名の変更'); },
-      'layer.up': () => d.moveLayer(d.active, d.indexOf(d.active) + 1),
-      'layer.down': () => d.moveLayer(d.active, d.indexOf(d.active) - 1),
-      'layer.top': () => d.moveLayer(d.active, d.layers.length - 1),
-      'layer.bottom': () => d.moveLayer(d.active, 0),
-      'layer.mergeDown': () => { if (!d.mergeDown()) toast('下にレイヤーがありません'); },
+      'layer.up': () => d.moveLayer(d.active, 'up'),
+      'layer.down': () => d.moveLayer(d.active, 'down'),
+      'layer.top': () => d.moveLayer(d.active, 'top'),
+      'layer.bottom': () => d.moveLayer(d.active, 'bottom'),
+      'layer.mergeDown': () => { const why = d.mergeDown(); if (why) toast(why); },
       'layer.mergeVisible': () => d.flatten({ visibleOnly: true }),
       'layer.viaCopy': () => this.layerVia(false),
       'layer.viaCut': () => this.layerVia(true),
@@ -626,7 +705,8 @@ class App {
       'select.grow': () => this.selNumberDialog('選択範囲を拡張', '拡張量', 4, (v) => Sel.grow(d.sel, v, d.width, d.height)),
       'select.shrink': () => this.selNumberDialog('選択範囲を縮小', '縮小量', 4, (v) => Sel.grow(d.sel, -v, d.width, d.height)),
       'select.layerAlpha': () => {
-        const c = cloneCanvas(d.active.canvas);
+        const l = d.active;
+        const c = l.canvas ? cloneCanvas(l.canvas) : d.flattened({ layers: d.block(l) });
         const g = ctx2d(c); g.globalCompositeOperation = 'source-in'; g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height);
         d.setSelection(Sel.fromCanvas(c), '不透明部分を選択');
       },
@@ -697,14 +777,31 @@ class App {
         }
         return out;
       }
-      case 'layer': return [
-        it('新規レイヤー', 'layer.new', '⇧' + M + 'N'), it('レイヤーを複製', 'layer.duplicate'), it('レイヤーを削除', 'layer.delete'),
-        it('名前を変更…', 'layer.rename'), '-',
+      case 'layer': {
+        const l = d.active;
+        const sub = (label, items) => ({ label: label + ' ▸', action: () => openMenu($('#menubar [data-menu="layer"]'), items) });
+        return [
+        it('新規レイヤー', 'layer.new', '⇧' + M + 'N'), it('新規グループ', 'layer.newGroup'), it('新規調整レイヤー…', 'layer.adjustNew'),
+        it('レイヤーを複製', 'layer.duplicate'), it('レイヤーを削除', 'layer.delete'), it('名前を変更…', 'layer.rename'), '-',
+        it('レイヤースタイル…', 'layer.styles', '', { disabled: !l.canvas }),
+        it(l.clip ? 'クリッピングマスクを解除' : 'クリッピングマスクを作成', 'layer.clip', '⌥' + M + 'G'),
+        sub('レイヤーマスク', l.mask ? [
+          it(l.mask_enabled === false ? 'マスクを有効にする' : 'マスクを無効にする', 'mask.toggle'),
+          it(d.editingMask ? 'レイヤーの絵を編集する' : 'マスクを編集する', 'mask.edit', '\\'),
+          it('マスクを反転', 'mask.invert'), it('マスクを選択範囲に', 'mask.toSel'), '-',
+          it('マスクを適用（画素に焼き込む）', 'mask.apply'), it('マスクを削除', 'mask.delete'),
+        ] : [
+          it('すべて表示（白）で追加', 'mask.add'), it('すべて隠す（黒）で追加', 'mask.hide'), it('選択範囲から追加', 'mask.addSel', '', { disabled: !d.sel }),
+        ]), '-',
+        it('グループ化', 'layer.group', M + 'G'), it('グループ解除', 'layer.ungroup', '⇧' + M + 'G', { disabled: !l.isGroup }),
+        it('グループを結合', 'layer.mergeGroup', '', { disabled: !l.isGroup }), '-',
+        it(l.isText ? 'テキストをラスタライズ' : 'スタイルをラスタライズ', 'layer.rasterize', '', { disabled: !l.isText && !l.hasStyles() }), '-',
         it('選択範囲をコピーしたレイヤー', 'layer.viaCopy', M + 'J'), it('選択範囲をカットしたレイヤー', 'layer.viaCut', '⇧' + M + 'J'), '-',
         it('下のレイヤーと結合', 'layer.mergeDown', M + 'E'), it('表示レイヤーを結合', 'layer.mergeVisible', '⇧' + M + 'E'), '-',
         it('最前面へ', 'layer.top'), it('前面へ', 'layer.up', M + ']'), it('背面へ', 'layer.down', M + '['), it('最背面へ', 'layer.bottom'), '-',
         it('レイヤーを左右反転', 'layer.flipH'), it('レイヤーを上下反転', 'layer.flipV'),
       ];
+      }
       case 'select': return [
         it('すべてを選択', 'select.all', M + 'A'), it('選択を解除', 'select.none', M + 'D', { disabled: !hasSel }),
         it('選択範囲を反転', 'select.invert', '⇧' + M + 'I', { disabled: !hasSel }), '-',
@@ -728,6 +825,12 @@ class App {
       }
     }
     return [];
+  }
+
+  /** 新規調整レイヤーの種類を選ぶ（exe でも開ける種類だけ。自動補正は全体の統計に依存するので除く） */
+  adjustLayerMenu() {
+    const keys = Object.keys(ADJUSTMENTS).filter((k) => !ADJUSTMENTS[k].webOnly && !k.startsWith('auto_'));
+    openMenu($('#menubar [data-menu="layer"]'), keys.map((k) => ({ label: ADJUSTMENTS[k].label, action: () => this.layerUI.newAdjustment(k) })));
   }
 
   // ---- 画面の部品をつなぐ
@@ -785,6 +888,8 @@ class App {
       if (mod) {
         if (k === 'z') return run(e.shiftKey ? 'edit.redo' : 'edit.undo');
         if (k === 't') return run('edit.transform');
+        if (k === 'g' && e.altKey) return run('layer.clip');
+        if (k === 'g') return run(e.shiftKey ? 'layer.ungroup' : 'layer.group');
         if (k === 'l') return run(e.shiftKey ? 'adj.auto_tone' : 'adj.levels');
         if (k === 'm') return run('adj.curves');
         if (k === 'u') return run(e.shiftKey ? 'adj.desaturate' : 'adj.hue_saturation');
@@ -820,11 +925,13 @@ class App {
       if (k === 'Escape') {
         if (this.view.mode === 'tool') this.view.cancelTool();
         else if (this.adjust.open) this.adjust.cancel();
+        else if (this.layerUI.open) this.layerUI.cancel();
         else if (this.tool.state) this.tool.cancelAll();
         return;
       }
       if (k === 'Enter') {
         if (this.adjust.open) { e.preventDefault(); this.adjust.ok(); return; }
+        if (this.layerUI.open) return;           // テキストの改行のため Enter は使わない
         if (this.tool.state) { e.preventDefault(); this.tool.commit(); return; }
         if (this.toolName === 'crop') { e.preventDefault(); this.tool.commit(); return; }
         return;
@@ -837,7 +944,8 @@ class App {
         this.tools.move.nudge(dx, dy);
         return;
       }
-      const map = { c: 'crop', v: 'move', m: 'marquee_rect', l: 'lasso', w: 'wand', b: 'brush', e: 'eraser', g: 'fill', i: 'eyedropper', h: 'hand', z: 'zoom' };
+      if (k === '\\') { this.cmd('mask.edit'); return; }
+      const map = { t: 'text', c: 'crop', v: 'move', m: 'marquee_rect', l: 'lasso', w: 'wand', b: 'brush', e: 'eraser', g: 'fill', i: 'eyedropper', h: 'hand', z: 'zoom' };
       if (map[k]) {
         if (k === 'm' && this.toolName === 'marquee_rect') return this.selectTool('marquee_ellipse');
         if (k === 'g' && this.toolName === 'fill') return this.selectTool('gradient');
