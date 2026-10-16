@@ -7,18 +7,21 @@
 const _pool = new Map();
 function poolCanvas(key, w, h) {
   let c = _pool.get(key);
+  // 大きさは毎回ちょうどに（大きいまま使い回すと、画素の読み出しのたびに全体が読まれて遅くなる）
   if (!c) { c = newCanvas(w, h); _pool.set(key, c); }
-  else if (c.width < w || c.height < h) { c.width = Math.max(c.width, w); c.height = Math.max(c.height, h); }
+  else if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
   const g = ctx2d(c);
   g.setTransform(1, 0, 0, 1, 0, 0);
   g.globalAlpha = 1;
   g.globalCompositeOperation = 'source-over';
-  g.shadowColor = 'rgba(0,0,0,0)'; g.shadowBlur = 0; g.shadowOffsetX = 0; g.shadowOffsetY = 0;
-  g.clearRect(0, 0, c.width, c.height);
+  g.clearRect(0, 0, w, h);          // 使うのは左上の w×h だけ（大きな canvas 全体を毎回消さない）
   return c;
 }
-/** 大きくなった作業用 canvas を手放す（作品を閉じた時など） */
-function releasePool() { _pool.clear(); }
+/** 作業用 canvas を手放す（作品を閉じた時など）。iOS は大きさを 0 にするとすぐメモリが返る */
+function releasePool() {
+  for (const c of _pool.values()) { c.width = 0; c.height = 0; }
+  _pool.clear();
+}
 
 function gcoFor(blend) { return (BLEND[blend] || BLEND.normal).gco; }
 
@@ -239,7 +242,17 @@ function styleMargin(styles) {
 }
 
 function styledSource(ctx, layer, pix, mask, depth) {
-  const { doc, r } = ctx;
+  const { doc, r, w, h } = ctx;
+  if (!liveOf(ctx, layer)) {
+    // 描いていないレイヤーは「中身＋効果」を覚えておいて使い回す（毎コマ計算し直さない）
+    const fx = styleCache(doc, layer, pix, mask);
+    const t = poolCanvas('src' + depth, w, h);
+    if (fx.canvas) {
+      const I = Rect.intersect(r, { x: fx.x, y: fx.y, w: fx.canvas.width, h: fx.canvas.height });
+      if (I) ctx2d(t).drawImage(fx.canvas, I.x - fx.x, I.y - fx.y, I.w, I.h, I.x - r.x, I.y - r.y, I.w, I.h);
+    }
+    return { canvas: t, ox: 0, oy: 0 };
+  }
   const E = Rect.clampTo(r, doc.width, doc.height, styleMargin(layer.styles));
   const cont = poolCanvas('sc' + depth, E.w, E.h), gc = ctx2d(cont);
   gc.drawImage(pix, E.x, E.y, E.w, E.h, 0, 0, E.w, E.h);
@@ -247,6 +260,33 @@ function styledSource(ctx, layer, pix, mask, depth) {
   const out = poolCanvas('so' + depth, E.w, E.h);
   drawStyles(out, cont, E.w, E.h, layer.styles, depth);
   return { canvas: out, ox: r.x - E.x, oy: r.y - E.y };
+}
+
+/** スタイル付きレイヤーの「中身＋効果」（中身のある範囲＋余白だけ）。画素・マスク・スタイルが変わったら作り直す */
+function styleCache(doc, layer, pix, mask) {
+  const f = layer._fx;
+  if (f && f.pix === pix && f.ver === layer.ver && f.styles === layer.styles && f.mask === mask && f.W === doc.width && f.H === doc.height) return f;
+  const W = doc.width, H = doc.height;
+  let src = pix;
+  if (mask) {
+    src = newCanvas(W, H);
+    const g = ctx2d(src);
+    g.drawImage(pix, 0, 0);
+    g.globalCompositeOperation = 'destination-in';
+    g.drawImage(mask, 0, 0);
+  }
+  const b = alphaBounds(src);
+  const out = { pix, ver: layer.ver, styles: layer.styles, mask, W, H, canvas: null, x: 0, y: 0 };
+  if (b) {
+    const E = Rect.clampTo(b, W, H, styleMargin(layer.styles) + 2);
+    const cont = newCanvas(E.w, E.h);
+    ctx2d(cont).drawImage(src, -E.x, -E.y);
+    const res = newCanvas(E.w, E.h);
+    drawStyles(res, cont, E.w, E.h, layer.styles, 'fx');
+    Object.assign(out, { canvas: res, x: E.x, y: E.y });
+  }
+  layer._fx = out;
+  return out;
 }
 
 function readAlpha(c, w, h) {

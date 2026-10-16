@@ -641,3 +641,89 @@ async function saikoboSelfTest4() {
   const fails = out.filter((l) => l.startsWith('FAIL')).length;
   return out.join('\n') + `\n---- ${out.filter((l) => l.startsWith('OK')).length} OK / ${fails} FAIL`;
 }
+
+
+/* フェーズ5: 速さ（スタイルの使い回し・描き直さない変更）・メモリ・端のスライダー・長押しスポイト */
+async function saikoboSelfTest5() {
+  const out = [];
+  const ok = (cond, msg) => { out.push((cond ? 'OK   ' : 'FAIL ') + msg); };
+  const wait = (ms = 30) => new Promise((r) => setTimeout(r, ms));
+  const view = app.view, cv = view.canvas;
+  const scr = (x, y) => { const r = cv.getBoundingClientRect(); const s = view.toScreen(x, y); return { clientX: r.left + s.x, clientY: r.top + s.y }; };
+  const fire = (type, id, pointerType, pos) => cv.dispatchEvent(new PointerEvent(type, { pointerId: id, pointerType, bubbles: true, cancelable: true, isPrimary: true, buttons: type === 'pointerup' ? 0 : 1, pressure: 0.5, ...pos }));
+
+  if (app.doc) await app.closeDoc();
+  const doc = new Doc(300, 200, { name: '自己テスト5', background: '#ffffff' });
+  doc.history.clear('新規');
+  app.openDoc(doc);
+  await wait(50);
+
+  // 1) スタイルの使い回し
+  const l = new Layer(300, 200, '円');
+  l.ctx.fillStyle = '#ff0000'; l.ctx.beginPath(); l.ctx.arc(150, 100, 50, 0, Math.PI * 2); l.ctx.fill();
+  l.styles = { stroke: { ...styleDefaults('stroke'), size: 4 } };
+  doc.insertAbove(l, doc.active); doc.activeId = l.id; doc.compDirty = doc.fullRect;
+  doc.composite();
+  const fx1 = l._fx;
+  doc.invalidate({ x: 0, y: 0, w: 50, h: 50 }); doc.composite();
+  ok(fx1 && fx1.canvas && l._fx === fx1, 'スタイルの結果を覚えて使い回す（ほかの所を描き直しても計算し直さない）');
+  ok(fx1.canvas.width < 300 && fx1.x > 0, 'スタイルは中身のある範囲だけ計算する');
+  l.ver++; doc.invalidate(); doc.composite();
+  ok(l._fx !== fx1, '画素が変わったら作り直す');
+
+  // 2) 名前・ロックの変更では絵を描き直さない
+  doc.composite();
+  doc.setLayerProps(l, { name: '丸' });
+  ok(!doc.compDirty, '名前の変更では描き直さない');
+  doc.setLayerProps(l, { opacity: 0.5 });
+  ok(!!doc.compDirty, '不透明度の変更は描き直す');
+
+  // 3) 端のスライダー
+  app.selectTool('brush');
+  const es = app.edgeSliders;
+  ok(!es.root.hidden, 'ブラシでは端のスライダーが出る');
+  const track = es.size.node.querySelector('.es-track');
+  const r = track.getBoundingClientRect();
+  const keep = app.tools.brush.opts.size;
+  track.dispatchEvent(new PointerEvent('pointerdown', { pointerId: 77, bubbles: true, clientX: r.left + 5, clientY: r.top + r.height * 0.5, buttons: 1 }));
+  track.dispatchEvent(new PointerEvent('pointerup', { pointerId: 77, bubbles: true, clientX: r.left + 5, clientY: r.top + r.height * 0.5 }));
+  const sz = app.tools.brush.opts.size;
+  ok(sz > 100 && sz < 150, `サイズのスライダー（真ん中 → ${sz}px）`);
+  app.tools.brush.setOpt('size', keep); es.update();
+  app.selectTool('move');
+  ok(es.root.hidden, 'ブラシ以外では隠れる');
+
+  // 4) 長押しスポイト（指で描かない設定のとき）
+  app.selectTool('brush');
+  const fd = app.settings.fingerDraws;
+  app.settings.fingerDraws = false;
+  app.setFg('#000000', { recent: false });
+  fire('pointerdown', 801, 'touch', scr(150, 100));
+  await wait(550);
+  ok(view.mode === 'pick' && app.fg !== '#000000', `指を止めて 0.5 秒でスポイト（${app.fg}）`);
+  fire('pointerup', 801, 'touch', scr(150, 100));
+  await wait(20);
+  ok(view.mode === null && app.recent[0] === app.fg, '離すと色が確定（最近の色に入る）');
+  fire('pointerdown', 802, 'touch', scr(20, 20));
+  fire('pointermove', 802, 'touch', scr(60, 40));
+  await wait(550);
+  ok(view.mode === 'pan', '動かしたら移動のまま（スポイトにならない）');
+  fire('pointerup', 802, 'touch', scr(60, 40));
+  app.settings.fingerDraws = fd;
+  view.fit();
+
+  // 5) メモリ: 閉じたら作業用 canvas を返す
+  app.cmd('adj.brightness_contrast');
+  ok(!!app._scratch.adjust, '補正パネルの作業用 canvas');
+  app.adjust.cancel();
+  ok(!app._scratch.adjust, 'パネルを閉じたら返す');
+  const id = doc.workId;
+  await app.closeDoc();
+  ok(Object.keys(app._scratch).length === 0, '作品を閉じたら作業用 canvas を全部返す');
+  if (id) await Store.remove(id);
+  await app.showGallery();
+  app.selectTool('brush');
+
+  const fails = out.filter((l2) => l2.startsWith('FAIL')).length;
+  return out.join('\n') + `\n---- ${out.length - fails} OK / ${fails} FAIL`;
+}

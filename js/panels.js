@@ -82,6 +82,7 @@ function buildOptbar(app) {
         tool.setOpt(s.key, v);
         val.textContent = v + s.unit;
         app.view.request();
+        if (app.edgeSliders) app.edgeSliders.update();
       });
       val.addEventListener('click', async () => {
         const r = await openDialog({ title: s.label, fields: [{ key: 'v', label: s.label, type: 'number', value: tool.opts[s.key], min: s.min, max: s.max }] });
@@ -372,7 +373,7 @@ class LayersPanel {
   dragHandle(h, layer) {
     h.addEventListener('pointerdown', (e) => {
       e.preventDefault(); e.stopPropagation();
-      h.setPointerCapture(e.pointerId);
+      try { h.setPointerCapture(e.pointerId); } catch { /* 合成イベントなど */ }
       const li = h.closest('.layer-item');
       li.classList.add('dragging');
       let target = null, place = null;
@@ -438,7 +439,7 @@ class ColorPanel {
       fn(clamp((e.clientX - r.left) / r.width, 0, 1), clamp((e.clientY - r.top) / r.height, 0, 1));
     };
     c.addEventListener('pointerdown', (e) => {
-      c.setPointerCapture(e.pointerId);
+      try { c.setPointerCapture(e.pointerId); } catch { /* 合成イベントなど */ }
       at(e);
       const mv = (ev) => at(ev);
       const up = () => {
@@ -516,4 +517,55 @@ function renderHistory(app) {
   h.list.forEach((c, i) => add(c.label, i + 1));
   const cur = ol.querySelector('.cur');
   if (cur) cur.scrollIntoView({ block: 'nearest' });
+}
+
+// ---- 画面の端のスライダー（ブラシ・消しゴムのサイズと不透明度。iPad で絵から目を離さずに変える） ----
+class EdgeSliders {
+  constructor(app) {
+    this.app = app;
+    this.root = el('div', { class: 'edge-sliders', hidden: true });
+    this.size = this.slider('サイズ', (t) => {
+      const tool = this.app.tool;
+      tool.setOpt('size', Math.max(1, Math.round(1 + Math.pow(t, 2) * 499)));
+      this.app.view.request();
+      return tool.opts.size + 'px';
+    });
+    this.op = this.slider('不透明度', (t) => {
+      const tool = this.app.tool;
+      tool.setOpt('opacity', Math.max(1, Math.round(t * 100)));
+      return tool.opts.opacity + '%';
+    });
+    this.root.append(this.size.node, this.op.node);
+    $('#viewport').append(this.root);
+  }
+  slider(label, onChange) {
+    const fill = el('div', { class: 'es-fill' }), knob = el('div', { class: 'es-knob' });
+    const tip = el('div', { class: 'es-tip', hidden: true });
+    const track = el('div', { class: 'es-track', 'aria-label': label, role: 'slider' }, fill, knob, tip);
+    const node = el('div', { class: 'es' }, track, el('div', { class: 'es-label' }, label === 'サイズ' ? '太さ' : '濃さ'));
+    const set = (t) => {
+      t = clamp(t, 0, 1);
+      fill.style.height = (t * 100) + '%';
+      knob.style.bottom = `calc(${t * 100}% - 8px)`;
+      return t;
+    };
+    const at = (e) => { const r = track.getBoundingClientRect(); return clamp(1 - (e.clientY - r.top) / r.height, 0, 1); };
+    track.addEventListener('pointerdown', (e) => {
+      e.preventDefault(); e.stopPropagation();
+      try { track.setPointerCapture(e.pointerId); } catch { /* 合成イベントなど */ }
+      const go = (ev) => { const t = set(at(ev)); tip.textContent = label + ' ' + onChange(t); tip.hidden = false; };
+      go(e);
+      const up = () => { track.removeEventListener('pointermove', go); track.removeEventListener('pointerup', up); track.removeEventListener('pointercancel', up); tip.hidden = true; buildOptbar(this.app); };
+      track.addEventListener('pointermove', go); track.addEventListener('pointerup', up); track.addEventListener('pointercancel', up);
+    });
+    return { node, set };
+  }
+  update() {
+    const t = this.app.tool;
+    const show = !!this.app.doc && t instanceof BrushTool && this.app.settings.edgeSliders !== false;
+    this.root.hidden = !show;
+    if (!show) return;
+    this.size.set(Math.sqrt((t.opts.size - 1) / 499));
+    this.op.set(t.opts.opacity / 100);
+  }
 }

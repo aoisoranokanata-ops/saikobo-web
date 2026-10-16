@@ -1,7 +1,7 @@
 'use strict';
 /* アプリ本体: 画面の切り替え・コマンド・メニュー・キーボード・自動保存 */
 
-const APP_VERSION = '0.4.0';
+const APP_VERSION = '1.0.0';
 
 class App {
   constructor() {
@@ -19,6 +19,7 @@ class App {
     this.colorPanel = new ColorPanel(this);
     this.adjust = new AdjustPanel(this);
     this.layerUI = new LayerUI(this);
+    this.edgeSliders = new EdgeSliders(this);
     this.lastFilter = null;
     this.prevTool = null;
     this._scratch = {};
@@ -35,6 +36,14 @@ class App {
   saveSettings() { const { _penNoticed, ...s } = this.settings; LS.set('settings', s); }
 
   /** 文書と同じ大きさの作業用 canvas（使い回す） */
+  /** 作業用 canvas を手放す（iOS は大きさを 0 にするとすぐメモリが返る）。name を省くと全部 */
+  releaseScratch(name) {
+    for (const k of name ? [name] : Object.keys(this._scratch)) {
+      const c = this._scratch[k];
+      if (c) { c.width = 0; c.height = 0; }
+      delete this._scratch[k];
+    }
+  }
   scratch(name) {
     const d = this.doc;
     let c = this._scratch[name];
@@ -73,6 +82,18 @@ class App {
     this.colorPanel.sync();
   }
 
+  /** 合成結果の色を描画色に（長押しスポイト） */
+  pickColorAt(p) {
+    const d = this.doc;
+    if (!d) return;
+    const x = Math.floor(p.x), y = Math.floor(p.y);
+    if (x < 0 || y < 0 || x >= d.width || y >= d.height) return;
+    const px = ctx2d(d.composite()).getImageData(x, y, 1, 1).data;
+    if (!px[3]) return;
+    const a = px[3] / 255;
+    this.setFg(Color.rgbToHex(px[0] * a + 255 * (1 - a), px[1] * a + 255 * (1 - a), px[2] * a + 255 * (1 - a)), { recent: false });
+  }
+
   // ---- ツール
   selectTool(name) {
     const next = this.tools[name];
@@ -89,6 +110,7 @@ class App {
     if (!next.activate) LS.set('tool', name);
     updateToolbar(this);
     buildOptbar(this);
+    this.edgeSliders.update();
     this.view.request();
   }
   /** 変形中・補正パネル表示中なら、ほかの操作の前に確定（変形）・取り消し（補正）する */
@@ -138,6 +160,7 @@ class App {
     const step = s < 10 ? 1 : s < 50 ? 5 : s < 200 ? 10 : 25;
     t.setOpt('size', clamp(s + dir * step, 1, 500));
     buildOptbar(this);
+    this.edgeSliders.update();
     this.view.request();
   }
 
@@ -175,6 +198,7 @@ class App {
     this.layersPanel.render();
     updateToolbar(this);
     buildOptbar(this);
+    this.edgeSliders.update();
     this.updateUndo();
     renderHistory(this);
     this.view._needFit = true;
@@ -200,7 +224,8 @@ class App {
     }
     this.saveState('ok');
     this.doc = null;
-    this._scratch = {};
+    this.releaseScratch();
+    releasePool();
     Store.blobCache.clear();
   }
   onDocEvent(type, data) {
@@ -347,6 +372,7 @@ class App {
     ]);
   }
   async newWorkDialog() {
+    const memNote = el('p', { class: 'dlg-msg mem-note' });
     const presets = [['iPad 画面', 2732, 2048], ['正方形', 2048, 2048], ['フル HD', 1920, 1080], ['A4 縦 (200dpi)', 1654, 2339], ['はがき (300dpi)', 1181, 1748], ['SNS 縦', 1080, 1350]];
     const box = el('div', { class: 'presets' });
     const r0 = openDialog({
@@ -357,20 +383,29 @@ class App {
         { key: 'h', label: '高さ', type: 'number', value: LS.get('newH', 1536), min: 1, max: 8192, suffix: 'px' },
         { key: 'bg', label: '背景', type: 'select', value: LS.get('newBg', 'white'), options: [['white', '白'], ['transparent', '透明'], ['bgcolor', '背景色']] },
       ],
-      extra: box,
+      extra: el('div', {}, box, memNote),
       buttons: [{ label: 'キャンセル', value: 'cancel' }, { label: '作成', value: 'ok', primary: true }],
+      onInput: (v) => showMem(v.w, v.h),
       init: (inputs) => {
+        setTimeout(() => showMem(Number(inputs.w.value), Number(inputs.h.value)), 0);
         for (const [l, w, h] of presets) {
-          box.append(el('button', { type: 'button', onclick: () => { inputs.w.value = w; inputs.h.value = h; } }, `${l} ${w}×${h}`));
+          box.append(el('button', { type: 'button', onclick: () => { inputs.w.value = w; inputs.h.value = h; showMem(w, h); } }, `${l} ${w}×${h}`));
         }
         box.append(el('button', { type: 'button', onclick: () => { const t = inputs.w.value; inputs.w.value = inputs.h.value; inputs.h.value = t; } }, '縦横を入れ替え'));
       },
     });
+    function showMem(w, h) {
+      const per = (w * h * 4) / 1048576;
+      const cap = memoryBudgetMB();
+      const layers = Math.max(0, Math.floor(cap / per) - 6);
+      memNote.textContent = sizeOk(w, h) ? `1 レイヤー 約 ${Math.round(per)}MB。この端末では目安としてレイヤー ${layers} 枚くらいまで` : '大きすぎます（最大 8192px・1,677 万画素）';
+      memNote.classList.toggle('warn', layers < 8);
+    }
     const r = await r0;
     if (!r) return;
     const w = Math.round(r.values.w), h = Math.round(r.values.h);
     if (!sizeOk(w, h)) { toast('大きさは 1〜8192px、面積 1,677 万画素までにしてください', { error: true }); return; }
-    if (Math.max(w, h) > MAX_SIDE && IS_IOS) toast('大きな作品は iPad のメモリを多く使います。レイヤーは少なめに', { ms: 4000 });
+    if (Math.floor(memoryBudgetMB() / ((w * h * 4) / 1048576)) - 6 < 8) toast('大きな作品はメモリを多く使います。レイヤーは少なめにしてください', { ms: 4000 });
     LS.set('newW', w); LS.set('newH', h); LS.set('newBg', r.values.bg);
     const bg = r.values.bg === 'white' ? '#ffffff' : r.values.bg === 'bgcolor' ? this.bg : null;
     const doc = new Doc(w, h, { name: r.values.name.trim() || '名称未設定', background: bg });
@@ -852,7 +887,9 @@ class App {
         return [
           it('画面に合わせる', 'view.fit', M + '0'), it('100%（実際の大きさ）', 'view.actual', M + '1'),
           it('ズームイン', 'view.zoomIn', M + '+'), it('ズームアウト', 'view.zoomOut', M + '−'), '-',
-          { head: '指での操作' },
+          { label: '画面の端にサイズ・不透明度のスライダー', checked: this.settings.edgeSliders !== false, action: () => { this.settings.edgeSliders = this.settings.edgeSliders === false; this.saveSettings(); this.edgeSliders.update(); } },
+          '-',
+          { head: '指での操作（ペンを使うと 1本指 = 移動・長押し = スポイト）' },
           { label: '指でも描く（Pencil を使ったら切り替え）', checked: fd === 'auto', action: setFd('auto', '指でも描きます（Apple Pencil を使ったら自動で切り替え）') },
           { label: '指でも描く（常に）', checked: fd === true, action: setFd(true, '指でも描きます') },
           { label: '指では描かない（1本指で移動）', checked: fd === false, action: setFd(false, '指では描きません（1本指 = 画面の移動）') },
@@ -1005,6 +1042,12 @@ class App {
 /** ZIP（.sko）かどうかを先頭の4バイトで見る（名前に拡張子が無い時のため） */
 async function isZip(file) {
   try { const b = new Uint8Array(await file.slice(0, 4).arrayBuffer()); return b[0] === 0x50 && b[1] === 0x4b && b[2] === 3 && b[3] === 4; } catch { return false; }
+}
+/** canvas に使ってよいメモリのおおよその上限（MB）。iPad の Safari は 1GB 前後で落ちることがあるので控えめに */
+function memoryBudgetMB() {
+  const dm = navigator.deviceMemory || 0;                    // Safari には無い
+  if (IS_IOS) return 700;
+  return dm ? Math.min(2000, dm * 250) : 1500;
 }
 function safeName(s) { return String(s || '作品').replace(/[\\/:*?"<>|]/g, '_').slice(0, 80); }
 

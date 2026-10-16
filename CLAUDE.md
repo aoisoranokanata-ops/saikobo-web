@@ -91,6 +91,20 @@ PSD は後回し（フェーズ4で検討）、16bit・ICC 変換（ブラウザ
 - 開発サーバーは `tools/devserver.py`（キャッシュさせない＋ fixtures への PUT を受け取る。127.0.0.1 だけ）。launch.json の saikobo-web がこれ。
   素の http.server だと直した js が古いまま読まれることがあった（Cache-Control が無いので）。
 
+## 設計の要点（フェーズ5: 速さ・メモリ・iPad の操作）
+- 速さは `tools/bench.js`（2048×1536・12 枚・調整・スタイル・テキスト入り）で測る。2026-10-17 の PC で
+  ブラシ1コマ 92ms → 2.9ms、描き終わり 684 → 31ms、全体の描き直し 1443 → 381ms。iPad 実機は数倍かかる目安。
+- 効いたこと:
+  1. **スタイル付きレイヤーの「中身＋効果」を `layer._fx` に覚えて使い回す**（画素の ver・スタイル・マスクが変わったら作り直す。
+     計算は中身のある範囲＋余白だけ）。描いている最中のレイヤーだけは毎コマ計算する。
+  2. **作業用 canvas の大きさは毎回ちょうどに**。大きいまま使い回すと、調整レイヤーの getImageData のあと canvas が
+     CPU 描画に切り替わり、そこへ描く全レイヤーが遅くなった（33ms → 3ms）。
+  3. 名前・ロックだけの変更は描き直さない（`visualChange`）。色相・彩度は画素ごとの配列を作らない書き方に。
+- メモリ: 作品を閉じたら作業用 canvas を幅 0 にして返す（iOS はこれですぐ解放）。補正パネルの文書大 canvas も閉じたら返す。
+  新規作成の画面に「この大きさで使えるレイヤー数の目安」（iPad は canvas に 700MB まで使う想定）。
+- iPad の操作: 画面左端のスライダー（太さ・濃さ。`EdgeSliders`、表示メニューで隠せる）、指を 0.45 秒止めるとスポイト
+  （指で描かない設定＝1本指が移動のときだけ。8px 以上動いたら移動のまま）。
+
 ## ハマり所（実測）
 - **Uint8ClampedArray は代入時に四捨五入する**（偶数丸め）。`v + 0.5` を足すと半段ずれる（反転で 127 が 128 になった）。
   Uint8Array（切り捨て）とは違うので、書き込み先の型で丸め方を変えること。
@@ -101,12 +115,15 @@ PSD は後回し（フェーズ4で検討）、16bit・ICC 変換（ブラウザ
 - 保存は `saveNow()` が順番待ちの Promise（`_saveChain`）。保存中に呼ばれても「呼んだ時点までの変更」が書かれてから解決する。
   未保存かどうかは `doc.rev !== doc._savedRev`。rev は doc.emit のたび（'view' 以外）に増える → 名前の変更などは `doc.emit('meta')`。
 - プレビューのペインが隠れていると requestAnimationFrame が来ない → 自己テストは setTimeout で待つ。
+- `setPointerCapture` は合成イベント（自己テスト）だと例外になり、そのあとの処理が止まる → 必ず try で囲む。
+- 素の http.server で一度読んだ js はブラウザに残る（devserver に替えた後も）。おかしい時は `fetch(src, {cache:'reload'})` で取り直す。
 
 ## テスト
 - `tools/selftest.js`: 疑似的なペン・タッチ入力で確かめる。`saikoboSelfTest()`（フェーズ1: 描画・ジェスチャー・選択・移動・レイヤー・
   画像操作・保存/読み込み 30項目）と `saikoboSelfTest2()`（フェーズ2: ペンの種類・補正パネル・フィルター・自由変形・切り抜き 24項目）、
   `saikoboSelfTest3()`（フェーズ3: マスク・クリッピング・グループ・調整レイヤー・スタイル・テキスト・保存の往復 37項目）、
-  `saikoboSelfTest4()`（フェーズ4: ZIP・.sko の往復・exe の .sko との比較 11項目）。
+  `saikoboSelfTest4()`（フェーズ4: ZIP・.sko の往復・exe の .sko との比較 11項目）、
+  `saikoboSelfTest5()`（フェーズ5: スタイルの使い回し・描き直さない変更・端のスライダー・長押しスポイト・メモリ 14項目）。計 116 項目。
   プレビューで `<script src="/tools/selftest.js">` を読み込んでから await で呼ぶ。終わると作った作品は消す。
 - exe と同じ結果か: `python tools/make_fixtures.py` → プレビューで fixtures/input.png に `findSpec(key).fn` をかけ、index.json の各期待値 PNG と不透明部分の差を見る（2026-10-16 時点で ±1）。
 - アイコン: `python tools/make_icons.py`（exe 版と同じ絵）

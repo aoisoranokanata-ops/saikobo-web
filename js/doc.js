@@ -293,7 +293,7 @@ class Doc {
     this.history.push(new StateCmd(label, before, after));
     const resized = before.w !== after.w || before.h !== after.h;
     if (resized) { this.comp = newCanvas(this.width, this.height); this._backup = null; }
-    this.compDirty = this.fullRect;
+    if (visualChange(before, after)) this.compDirty = this.fullRect;    // 名前・ロックだけなら描き直さない
     this.emit('structure', { resized });
     return true;
   }
@@ -624,6 +624,22 @@ function matRectOnto(M, w, h) {
   const ps = [matApply(M, 0, 0), matApply(M, w, 0), matApply(M, 0, h), matApply(M, w, h)];
   const x0 = Math.min(...ps.map((p) => p.x)), y0 = Math.min(...ps.map((p) => p.y));
   return [x0, y0, Math.max(...ps.map((p) => p.x)) - x0, Math.max(...ps.map((p) => p.y)) - y0];
+}
+
+/** 絵が変わりうる違いがあるか（名前・ロック・グループの開閉だけなら false） */
+function visualChange(a, b) {
+  if (a.w !== b.w || a.h !== b.h || a.layers.length !== b.layers.length) return true;
+  const quiet = new Set(['name', 'locked', 'alpha_locked']);
+  for (let i = 0; i < a.layers.length; i++) {
+    const x = a.layers[i], y = b.layers[i];
+    if (x.layer !== y.layer || x.canvas !== y.canvas || x.mask !== y.mask) return true;
+    for (const k of [...LAYER_PROPS, 'extra']) {
+      if (x.props[k] === y.props[k] || quiet.has(k)) continue;
+      if (k === 'group' && x.props.group && y.props.group) continue;            // 開閉だけ
+      return true;
+    }
+  }
+  return false;
 }
 
 function sameSnapshot(a, b) {

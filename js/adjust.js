@@ -185,20 +185,45 @@ const AdjFns = {
     });
   },
   hue_saturation(src, w, h, p) {
-    return eachRGB(src, (r, g, b) => {
-      let [H, L, S] = rgbToHls(r, g, b);
-      if (p.colorize) {
-        H = (((p.hue % 360) + 360) % 360) / 360 * 256;
-        S = clamp(25 + p.saturation * 0.75, 0, 100) / 100 * 255;
-      } else {
-        H = (H + p.hue / 360 * 256 + 256) % 256;
-        if (p.saturation >= 0) S = S + (255 - S) * (p.saturation / 100) * Math.pow(S / 255, 0.25);
-        else S = S * (1 + p.saturation / 100);
+    // rgbToHls / hlsToRgb と同じ計算を、画素ごとの配列を作らずに（調整レイヤーで毎回全体にかかるので速さが要る）
+    const out = new Uint8ClampedArray(src.length);
+    const hueAdd = p.hue / 360 * 256, sat = p.saturation / 100, light = p.lightness / 100;
+    const cH = (((p.hue % 360) + 360) % 360) / 360 * 256, cS = clamp(25 + p.saturation * 0.75, 0, 100) / 100 * 255;
+    const f = (t, P, Q) => { t = (t + 360) % 360; return t < 60 ? P + (Q - P) * t / 60 : t < 180 ? Q : t < 240 ? P + (Q - P) * (240 - t) / 60 : P; };
+    // 同じ色は同じ結果なので、色ごとに覚えておく（写真でも平らな所・同じ色が多い）
+    const ck = new Int32Array(65536).fill(-1), cv = new Uint8ClampedArray(65536 * 3);
+    for (let i = 0; i < src.length; i += 4) {
+      const key = (src[i] << 16) | (src[i + 1] << 8) | src[i + 2];
+      const slot = Math.imul(key, 2654435761) >>> 16;
+      if (ck[slot] === key) { out[i] = cv[slot * 3]; out[i + 1] = cv[slot * 3 + 1]; out[i + 2] = cv[slot * 3 + 2]; out[i + 3] = src[i + 3]; continue; }
+      const r = src[i] / 255, g = src[i + 1] / 255, b = src[i + 2] / 255;
+      const mx = r > g ? (r > b ? r : b) : (g > b ? g : b), mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+      let L = (mx + mn) / 2, H = 0, S = 0;
+      const d = mx - mn;
+      if (d > 1e-6) {
+        S = L < 0.5 ? d / (mx + mn) : d / (2 - mx - mn);
+        let hh = mx === r ? (g - b) / d : mx === g ? 2 + (b - r) / d : 4 + (r - g) / d;
+        hh = (hh * 60 + 360) % 360;
+        H = hh / 360 * 256;
       }
-      if (p.lightness > 0) L = L + (255 - L) * p.lightness / 100;
-      else if (p.lightness < 0) L = L * (1 + p.lightness / 100);
-      return hlsToRgb(clamp(Math.round(H), 0, 255), clamp(Math.round(L), 0, 255), clamp(Math.round(S), 0, 255));
-    });
+      L *= 255; S *= 255;
+      if (p.colorize) { H = cH; S = cS; }
+      else {
+        H = (H + hueAdd + 256) % 256;
+        if (sat >= 0) S = S + (255 - S) * sat * Math.sqrt(Math.sqrt(S / 255)); else S = S * (1 + sat);
+      }
+      if (light > 0) L = L + (255 - L) * light; else if (light < 0) L = L * (1 + light);
+      H = Math.min(255, Math.max(0, Math.round(H))); L = Math.min(255, Math.max(0, Math.round(L))) / 255; S = Math.min(255, Math.max(0, Math.round(S))) / 255;
+      if (S <= 0) { out[i] = out[i + 1] = out[i + 2] = L * 255; }
+      else {
+        const hd = ((H / 256) * 360 + 360) % 360;
+        const Q = L < 0.5 ? L * (1 + S) : L + S - L * S, P0 = 2 * L - Q;
+        out[i] = f(hd + 120, P0, Q) * 255; out[i + 1] = f(hd, P0, Q) * 255; out[i + 2] = f(hd - 120, P0, Q) * 255;
+      }
+      out[i + 3] = src[i + 3];
+      ck[slot] = key; cv[slot * 3] = out[i]; cv[slot * 3 + 1] = out[i + 1]; cv[slot * 3 + 2] = out[i + 2];
+    }
+    return out;
   },
   color_balance(src, w, h, p) {
     const add = [p.cyan_red, p.magenta_green, p.yellow_blue];

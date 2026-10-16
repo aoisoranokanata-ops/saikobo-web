@@ -194,7 +194,7 @@ class AdjustPanel {
     let drag = -1, lastTap = 0;
     c.addEventListener('pointerdown', (e) => {
       e.preventDefault();
-      c.setPointerCapture(e.pointerId);
+      try { c.setPointerCapture(e.pointerId); } catch { /* 合成イベントなど */ }
       const [x, y] = toVal(e);
       const pts = this.params.points;
       const r = c.getBoundingClientRect(), tol = 24 / r.width * 255;
@@ -297,6 +297,8 @@ class AdjustPanel {
     const d = this.doc;
     if (d && d.live && d.live.canvas === this.liveC) d.live = null;
     this.spec = null; this.result = null; this.histC = null; this.hist = null;
+    this.app.releaseScratch('adjust');            // 文書と同じ大きさの作業用 canvas は使い終わったら返す
+    this.liveC = null;
     this.root.hidden = true;
     this.root.replaceChildren();
   }

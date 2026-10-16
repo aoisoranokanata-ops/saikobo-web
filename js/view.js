@@ -152,6 +152,14 @@ class View {
     g.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     const tool = this.app.tool;
     if (tool && tool.drawOverlay) tool.drawOverlay(g, this);
+    if (this.pickAt) {          // 長押しスポイトの輪（指で隠れないよう少し上に）
+      const s = this.toScreen(this.pickAt.x, this.pickAt.y);
+      g.lineWidth = 12; g.strokeStyle = this.app.fg;
+      g.beginPath(); g.arc(s.x, s.y - 70, 34, 0, Math.PI * 2); g.stroke();
+      g.lineWidth = 1.5; g.strokeStyle = '#fff';
+      g.beginPath(); g.arc(s.x, s.y - 70, 40.5, 0, Math.PI * 2); g.stroke();
+      g.beginPath(); g.arc(s.x, s.y - 70, 27.5, 0, Math.PI * 2); g.stroke();
+    }
   }
 
   // ---- 入力
@@ -226,8 +234,22 @@ class View {
     const lp = this.local(e);
     this.mode = 'pan';
     this.gesture = { sx: lp.x, sy: lp.y, ox: this.ox, oy: this.oy, id: e.pointerId };
+    // 指を置いたまま止めるとスポイト（ペンで描く設定のとき。iPad の描画アプリと同じ操作）
+    clearTimeout(this._holdT);
+    if (e.pointerType === 'touch' && this.app.toolName !== 'hand') {
+      const cx = e.clientX, cy = e.clientY;
+      this._holdT = setTimeout(() => {
+        if (this.mode !== 'pan' || !this.gesture || this.gesture.moved) return;
+        this.mode = 'pick';
+        this.pickAt = this.toDoc(cx, cy);
+        this.app.pickColorAt(this.pickAt);
+        this.request();
+      }, 450);
+    }
   }
   startPinch() {
+    clearTimeout(this._holdT);
+    if (this.mode === 'pick') { this.pickAt = null; }
     const pts = [...this.pointers.values()].filter((p) => p.type === 'touch');
     const [a, b] = pts;
     const prevTap = this.mode === 'pinch' && this.gesture ? this.gesture : null;
@@ -264,8 +286,16 @@ class View {
       this.request();
       return;
     }
+    if (this.mode === 'pick') {
+      this.pickAt = this.toDoc(e.clientX, e.clientY);
+      this.app.pickColorAt(this.pickAt);
+      this.request();
+      return;
+    }
     if (this.mode === 'pan') {
       if (this.gesture && e.pointerId === this.gesture.id) {
+        if (Math.hypot(lp.x - this.gesture.sx, lp.y - this.gesture.sy) > 8) { this.gesture.moved = true; clearTimeout(this._holdT); }
+        if (!this.gesture.moved) return;
         this.fitted = false;
         this.ox = this.gesture.ox + lp.x - this.gesture.sx;
         this.oy = this.gesture.oy + lp.y - this.gesture.sy;
@@ -299,7 +329,14 @@ class View {
       }
       return;
     }
+    if (this.mode === 'pick') {
+      this.mode = null; this.gesture = null; this.pickAt = null;
+      this.app.addRecent(this.app.fg);
+      this.request();
+      return;
+    }
     if (this.mode === 'pan') {
+      clearTimeout(this._holdT);
       if (this.gesture && e.pointerId === this.gesture.id) { this.mode = null; this.gesture = null; }
       return;
     }
